@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# SOC-BOTNET Standalone Builder v1.7.3
+# SOC-BOTNET Standalone Builder v1.7.4
 # One file: automatically clones SOC-BOTNET + SOC-BOTNET-UPDATE,
 # embeds the latest stateful RF detector, applies XFF overlay, and creates a ready-to-review
 # SOC-BOTNET-UNIFIED Git working tree. Capture interface and protected destination IPs are detected automatically at install time.
 
 BASE_URL="https://github.com/YosuaKev/SOC-BOTNET.git"
 UPDATE_URL="https://github.com/YosuaKev/SOC-BOTNET-UPDATE.git"
-BRANCH="unified-v1.7.3"
+BRANCH="unified-v1.7.4"
 FORCE=0
 NO_BRANCH=0
 
@@ -22,7 +22,7 @@ OUTPUT_REPO="$INVOKING_HOME/SOC-BOTNET-UNIFIED"
 
 usage() {
   cat <<'USAGE'
-SOC-BOTNET Standalone Builder v1.7.3
+SOC-BOTNET Standalone Builder v1.7.4
 
 This ONE script automatically:
   1. clones https://github.com/YosuaKev/SOC-BOTNET
@@ -33,7 +33,7 @@ This ONE script automatically:
   6. correlates target domain from Zeek http.log Host / ssl.log TLS SNI
   7. preserves the existing Filebeat/backend Agent/host metadata unchanged
   8. enforces final-CONFIRMED-session-only ML storage
-  9. creates unified install.sh + verify.sh and branch unified-v1.7.3
+  9. creates unified install.sh + verify.sh and branch unified-v1.7.4
 
 No manual git clone is required.
 No /opt/zeek-botnet-detector/src/detector.py is required to BUILD the repo.
@@ -43,7 +43,7 @@ Usage:
 
 Options:
   --output PATH      Output repository. Default: ~/SOC-BOTNET-UNIFIED
-  --branch NAME      Git branch to create. Default: unified-v1.7.3
+  --branch NAME      Git branch to create. Default: unified-v1.7.4
   --no-branch        Do not create a new Git branch
   --force            Replace existing output directory
   -h, --help         Show help
@@ -54,7 +54,7 @@ After build:
   git diff --stat
   git add .
   git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
-  git push -u origin unified-v1.7.3
+  git push -u origin unified-v1.7.4
 USAGE
 }
 
@@ -1398,7 +1398,7 @@ cat > "$OUTPUT_REPO/install.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.7.3-unified"
+VERSION="1.7.4-unified"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_INSTALL="$SCRIPT_DIR/install-base.sh"
 RUNTIME_CONF="/etc/zeek-botnet-detector.conf"
@@ -1738,23 +1738,136 @@ if [[ "$BASE_RC" -ne 0 ]]; then
   log "Base installer returned status $BASE_RC; checking whether core deployment completed so unified finalization can recover it"
 fi
 
-# The historical base installer can exit while starting the ML service before
-# the unified --protected-ip override is written. Continue only when all core
-# deployment artifacts exist; otherwise treat the base failure as real.
-[[ -r "$RUNTIME_CONF" ]] || die "Runtime config not found after base install: $RUNTIME_CONF"
-# shellcheck disable=SC1090
-source "$RUNTIME_CONF"
+# The historical base installer can return status 1 after the model contract
+# succeeds but before it writes /etc/zeek-botnet-detector.conf or finishes the
+# detector service units. Unified mode can recover that partial deployment as
+# long as the actual detector runtime, source files, and models are present.
+DEFAULT_INSTALL_DIR="/opt/zeek-botnet-detector"
+DEFAULT_CONN_LOG="/var/log/zeek/logs/current/conn.log"
+DEFAULT_HTTP_LOG="/var/log/zeek/logs/current/http.log"
+DEFAULT_SSL_LOG="/var/log/zeek/logs/current/ssl.log"
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/zeek-botnet-detector}"
-CONN_LOG="${CONN_LOG:-/var/log/zeek/logs/current/conn.log}"
-HTTP_LOG="${HTTP_LOG:-/var/log/zeek/logs/current/http.log}"
-SSL_LOG="${SSL_LOG:-/var/log/zeek/logs/current/ssl.log}"
+if [[ -r "$RUNTIME_CONF" ]]; then
+  # shellcheck disable=SC1090
+  source "$RUNTIME_CONF"
+else
+  log "Runtime config was not written by base installer; attempting unified recovery"
+  INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+  CONN_LOG="$DEFAULT_CONN_LOG"
+  HTTP_LOG="$DEFAULT_HTTP_LOG"
+  SSL_LOG="$DEFAULT_SSL_LOG"
+
+  [[ -x "$INSTALL_DIR/venv/bin/python" ]] \
+    || die "Base installer stopped before detector Python was ready: $INSTALL_DIR/venv/bin/python"
+  [[ -f "$INSTALL_DIR/src/detector.py" ]] \
+    || die "Base installer stopped before detector.py was deployed"
+  [[ -f "$INSTALL_DIR/src/behavior_detector.py" ]] \
+    || die "Base installer stopped before behavior_detector.py was deployed"
+  [[ -s "$INSTALL_DIR/models/rf_official_bro_final_pipeline.joblib" ]] \
+    || die "Base installer stopped before Random Forest model was deployed"
+  [[ -s "$INSTALL_DIR/models/zeek_official_active_feature_config.pkl" ]] \
+    || die "Base installer stopped before feature config was deployed"
+
+  ES_IGNORE_SERVICE="${ES_HOST#*://}"
+  ES_IGNORE_SERVICE="${ES_IGNORE_SERVICE%%/*}"
+
+  umask 077
+  cat > "$RUNTIME_CONF" <<EOF_RUNTIME
+INSTALL_DIR='$INSTALL_DIR'
+CONN_LOG='$CONN_LOG'
+HTTP_LOG='$HTTP_LOG'
+SSL_LOG='$SSL_LOG'
+IGNORE_SERVICES='$ES_IGNORE_SERVICE'
+BEHAVIOR_WINDOW='60'
+HTTP_THRESHOLD='20'
+SSH_THRESHOLD='10'
+PORT_THRESHOLD='15'
+HOST_THRESHOLD='15'
+FLOOD_WINDOW='10'
+FLOOD_THRESHOLD='100'
+BEACON_WINDOW='600'
+BEACON_MIN_CONNECTIONS='6'
+BEACON_MIN_INTERVAL='5'
+BEACON_MAX_INTERVAL='300'
+BEACON_MAX_CV='0.15'
+BEHAVIOR_COOLDOWN='60'
+EOF_RUNTIME
+  chmod 600 "$RUNTIME_CONF"
+  log "Recovered runtime config: $RUNTIME_CONF"
+fi
+
+INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+CONN_LOG="${CONN_LOG:-$DEFAULT_CONN_LOG}"
+HTTP_LOG="${HTTP_LOG:-$DEFAULT_HTTP_LOG}"
+SSL_LOG="${SSL_LOG:-$DEFAULT_SSL_LOG}"
 
 [[ -x "$INSTALL_DIR/venv/bin/python" ]] || die "Detector Python missing: $INSTALL_DIR/venv/bin/python"
 [[ -f "$INSTALL_DIR/src/detector.py" ]] || die "Deployed detector.py missing"
 [[ -f "$INSTALL_DIR/src/behavior_detector.py" ]] || die "Deployed behavior_detector.py missing"
-[[ -f /etc/systemd/system/zeek-botnet-detector.service ]] || die "ML service unit missing after base install"
-[[ -f /etc/systemd/system/zeek-behavior-detector.service ]] || die "Behavior service unit missing after base install"
+
+# Ensure the dedicated service account exists even when the base installer
+# stopped before its service-finalization stage.
+if ! id -u zeekbot >/dev/null 2>&1; then
+  NOLOGIN_SHELL="$(command -v nologin || true)"
+  [[ -n "$NOLOGIN_SHELL" ]] || NOLOGIN_SHELL="/sbin/nologin"
+  useradd --system --home-dir /var/lib/zeekbot --create-home \
+    --shell "$NOLOGIN_SHELL" zeekbot
+  log "Created service account: zeekbot"
+fi
+
+mkdir -p "$INSTALL_DIR/logs"
+chown zeekbot:zeekbot "$INSTALL_DIR/logs"
+chmod 750 "$INSTALL_DIR/logs"
+
+# If the base installer stopped before writing service units, create safe base
+# units. Their ExecStart values are replaced below by the unified drop-ins.
+if [[ ! -f /etc/systemd/system/zeek-botnet-detector.service ]]; then
+  cat > /etc/systemd/system/zeek-botnet-detector.service <<EOF_ML_BASE
+[Unit]
+Description=Zeek Random Forest Botnet Detector (Shadow Mode)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zeekbot
+Group=zeekbot
+WorkingDirectory=$INSTALL_DIR/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/false
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_ML_BASE
+  log "Recovered missing zeek-botnet-detector.service"
+fi
+
+if [[ ! -f /etc/systemd/system/zeek-behavior-detector.service ]]; then
+  cat > /etc/systemd/system/zeek-behavior-detector.service <<EOF_BEHAVIOR_BASE
+[Unit]
+Description=Zeek Multi-Behavior Security Detector (Shadow Mode)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zeekbot
+Group=zeekbot
+WorkingDirectory=$INSTALL_DIR/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/false
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_BEHAVIOR_BASE
+  log "Recovered missing zeek-behavior-detector.service"
+fi
 
 proxy_args=()
 for proxy in "${TRUSTED_PROXIES[@]}"; do
@@ -2226,14 +2339,14 @@ sudo journalctl -u zeek-botnet-detector.service -n 30 --no-pager
 
 ## Push branch
 
-The builder keeps the `.git` history from SOC-BOTNET and creates `unified-v1.7.3` by default:
+The builder keeps the `.git` history from SOC-BOTNET and creates `unified-v1.7.4` by default:
 
 ```bash
 cd ~/SOC-BOTNET-UNIFIED
 git status
 git add .
 git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
-git push -u origin unified-v1.7.3
+git push -u origin unified-v1.7.4
 ```
 DOC
 
@@ -2242,7 +2355,7 @@ find "$OUTPUT_REPO" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/
 
 # Clean executable bits on Python payloads and make scripts executable.
 chmod 0644 "$OUTPUT_REPO/payload/src/detector.py" "$OUTPUT_REPO/payload/src/behavior_detector.py"
-chmod +x "$OUTPUT_REPO/install.sh" "$OUTPUT_REPO/install-base.sh" "$OUTPUT_REPO/verify.sh" "$OUTPUT_REPO/verify-base.sh" 2>/dev/null || true
+chmod +x "$OUTPUT_REPO/install.sh" "$OUTPUT_REPO/install-base.sh" "$OUTPUT_REPO/verify.sh" "$OUTPUT_REPO/verify-base.sh" "$OUTPUT_REPO/uninstall.sh" "$OUTPUT_REPO/deploy-many.sh" 2>/dev/null || true
 
 
 
