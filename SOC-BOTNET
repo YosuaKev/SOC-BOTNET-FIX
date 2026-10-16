@@ -1,0 +1,2038 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# SOC-BOTNET Standalone Builder v1.7.1
+# One file: automatically clones SOC-BOTNET + SOC-BOTNET-UPDATE,
+# embeds the latest stateful RF detector, applies XFF overlay, and creates a ready-to-review
+# SOC-BOTNET-UNIFIED Git working tree. Capture interface and protected destination IPs are detected automatically at install time.
+
+BASE_URL="https://github.com/YosuaKev/SOC-BOTNET.git"
+UPDATE_URL="https://github.com/YosuaKev/SOC-BOTNET-UPDATE.git"
+BRANCH="unified-v1.7.1"
+FORCE=0
+NO_BRANCH=0
+
+INVOKING_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+if command -v getent >/dev/null 2>&1; then
+  INVOKING_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6)"
+else
+  INVOKING_HOME="${HOME:-/tmp}"
+fi
+OUTPUT_REPO="$INVOKING_HOME/SOC-BOTNET-UNIFIED"
+
+usage() {
+  cat <<'USAGE'
+SOC-BOTNET Standalone Builder v1.7.1
+
+This ONE script automatically:
+  1. clones https://github.com/YosuaKev/SOC-BOTNET
+  2. clones https://github.com/YosuaKev/SOC-BOTNET-UPDATE
+  3. applies the update repo overlay/XFF-aware behavior detector
+  4. writes the latest stateful Random Forest detector.py
+  5. auto-detects capture interface and all protected IPv4 destinations
+  6. correlates target domain from Zeek http.log Host / ssl.log TLS SNI
+  7. preserves the existing Filebeat/backend Agent/host metadata unchanged
+  8. enforces final-CONFIRMED-session-only ML storage
+  9. creates unified install.sh + verify.sh and branch unified-v1.7.1
+
+No manual git clone is required.
+No /opt/zeek-botnet-detector/src/detector.py is required to BUILD the repo.
+
+Usage:
+  ./SOC-BOTNET [options]
+
+Options:
+  --output PATH      Output repository. Default: ~/SOC-BOTNET-UNIFIED
+  --branch NAME      Git branch to create. Default: unified-v1.7.1
+  --no-branch        Do not create a new Git branch
+  --force            Replace existing output directory
+  -h, --help         Show help
+
+After build:
+  cd ~/SOC-BOTNET-UNIFIED
+  git status
+  git diff --stat
+  git add .
+  git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
+  git push -u origin unified-v1.7.1
+USAGE
+}
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) [[ $# -ge 2 ]] || die "--output requires PATH"; OUTPUT_REPO="$2"; shift 2 ;;
+    --branch) [[ $# -ge 2 ]] || die "--branch requires NAME"; BRANCH="$2"; shift 2 ;;
+    --no-branch) NO_BRANCH=1; shift ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+for cmd in git python3 cp install grep sed find; do
+  command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+done
+
+if [[ -e "$OUTPUT_REPO" ]]; then
+  [[ "$FORCE" -eq 1 ]] || die "Output already exists: $OUTPUT_REPO (use --force to replace it)"
+  log "Removing existing output: $OUTPUT_REPO"
+  rm -rf -- "$OUTPUT_REPO"
+fi
+
+TMP_ROOT="$(mktemp -d -t soc-botnet-unified.XXXXXX)"
+cleanup() { rm -rf -- "$TMP_ROOT"; }
+trap cleanup EXIT
+BASE_REPO="$TMP_ROOT/SOC-BOTNET"
+UPDATE_REPO="$TMP_ROOT/SOC-BOTNET-UPDATE"
+
+log "[1/8] Cloning SOC-BOTNET"
+git clone "$BASE_URL" "$BASE_REPO"
+log "[2/8] Cloning SOC-BOTNET-UPDATE"
+git clone "$UPDATE_URL" "$UPDATE_REPO"
+
+[[ -f "$BASE_REPO/install.sh" ]] || die "Base repo install.sh not found"
+[[ -d "$BASE_REPO/payload/src" ]] || die "Base repo payload/src not found"
+
+log "[3/8] Copying base repository and Git history -> $OUTPUT_REPO"
+mkdir -p "$(dirname "$OUTPUT_REPO")"
+cp -a -- "$BASE_REPO" "$OUTPUT_REPO"
+
+# Apply the update repository overlay first, then ensure the two security
+# detector sources below are the final authoritative versions.
+if [[ -d "$UPDATE_REPO/repo-overlay" ]]; then
+  log "[4/8] Applying SOC-BOTNET-UPDATE repo-overlay"
+  cp -a -- "$UPDATE_REPO/repo-overlay/." "$OUTPUT_REPO/"
+else
+  log "[4/8] No repo-overlay directory; using explicit behavior detector lookup"
+fi
+
+BEHAVIOR_SOURCE=""
+for candidate in \
+  "$UPDATE_REPO/repo-overlay/src/behavior_detector.py" \
+  "$UPDATE_REPO/src/behavior_detector.py"; do
+  if [[ -f "$candidate" ]]; then
+    BEHAVIOR_SOURCE="$candidate"
+    break
+  fi
+done
+[[ -n "$BEHAVIOR_SOURCE" ]] || die "XFF-aware behavior_detector.py not found in update repo"
+install -m 0644 "$BEHAVIOR_SOURCE" "$OUTPUT_REPO/payload/src/behavior_detector.py"
+
+log "[5/8] Writing embedded latest detector.py"
+mkdir -p "$OUTPUT_REPO/payload/src"
+cat > "$OUTPUT_REPO/payload/src/detector.py" <<'PY_DETECTOR'
+#!/usr/bin/env python3
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+from collections import OrderedDict, defaultdict, deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+import joblib
+import numpy as np
+from feature_engineering import build_features
+
+BASE_DIR = Path("/opt/zeek-botnet-detector")
+MODEL_FILE = BASE_DIR / "models" / "rf_official_bro_final_pipeline.joblib"
+CONFIG_FILE = BASE_DIR / "models" / "zeek_official_active_feature_config.pkl"
+DETECTION_LOG = BASE_DIR / "logs" / "detections.jsonl"
+ALERT_LOG = BASE_DIR / "logs" / "botnet_alerts.jsonl"
+THRESHOLD = 0.50
+POLL_INTERVAL = 0.25
+
+# Random Forest remains the primary classifier.
+#
+# Stage 1:
+# Every Zeek conn.log record is classified by Random Forest.
+#
+# Stage 2:
+# Only RF-positive records participate in the rolling confirmation rule.
+# BOTNET is internally confirmed when >=50 RF-positive orig_pkts are
+# observed within a rolling 1-second window.
+#
+# Stage 3:
+# After confirmation, ALL subsequent records in the same traffic session
+# continue to pass through Random Forest and are counted separately as
+# BOTNET or NORMAL.
+#
+# Stage 4:
+# The final alert is written only when the session becomes idle or reaches
+# the maximum session duration.
+BOTNET_PACKET_THRESHOLD = 50
+BOTNET_PACKET_WINDOW_SECONDS = 1.0
+
+# Session is considered finished after no matching traffic for this period.
+ATTACK_IDLE_TIMEOUT = 3.0
+
+# Prevent an endless attack from waiting forever before being reported.
+ATTACK_MAX_DURATION = 60.0
+
+# Protected web ports. The protected destination IP is supplied at runtime
+# by --protected-ip. The unified installer auto-detects it from the selected
+# capture interface, so detector.py contains no hard-coded server IP.
+WEB_DESTINATIONS = set()
+WEB_PORTS = {80, 443}
+
+# Rolling RF-positive packets used only for BOTNET confirmation.
+BOTNET_PACKET_WINDOWS = defaultdict(deque)
+
+# Stateful traffic sessions.
+ATTACK_SESSIONS = {}
+
+
+def safe_int(value, default=-1):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_ignore_service(value):
+    value = str(value).strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0 or end + 1 >= len(value) or value[end + 1] != ":":
+            raise ValueError(f"invalid ignored service: {value}")
+        host = value[1:end]
+        port_text = value[end + 2 :]
+    else:
+        if ":" not in value:
+            raise ValueError(f"ignored service must be HOST:PORT: {value}")
+        host, port_text = value.rsplit(":", 1)
+    port = int(port_text)
+    if not host or not 0 <= port <= 65535:
+        raise ValueError(f"invalid ignored service: {value}")
+    return host, port
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--conn-log", required=True, help="Path to Zeek JSON conn.log")
+parser.add_argument(
+    "--http-log",
+    default="/opt/zeek/logs/current/http.log",
+    help="Path to Zeek JSON http.log used for X-Forwarded-For and HTTP Host correlation",
+)
+parser.add_argument(
+    "--ssl-log",
+    default="/opt/zeek/logs/current/ssl.log",
+    help="Path to Zeek JSON ssl.log used for TLS SNI domain correlation",
+)
+parser.add_argument(
+    "--trusted-proxy",
+    action="append",
+    default=[],
+    metavar="IP",
+    help="Proxy IP whose X-Forwarded-For header may be trusted. Repeatable.",
+)
+parser.add_argument(
+    "--protected-ip",
+    action="append",
+    default=[],
+    metavar="IP",
+    help=(
+        "Protected destination IP. Repeatable. The unified installer "
+        "auto-detects this from the selected capture interface."
+    ),
+)
+parser.add_argument("--from-start", action="store_true", help="Process existing log contents too")
+parser.add_argument(
+    "--ignore-service",
+    action="append",
+    default=[],
+    metavar="HOST:PORT",
+    help="Skip ML inference and all ML logging when either Zeek endpoint exactly matches HOST:PORT. Repeatable.",
+)
+args = parser.parse_args()
+CONN_LOG = Path(args.conn_log)
+HTTP_LOG = Path(args.http_log)
+SSL_LOG = Path(args.ssl_log)
+
+if not args.protected_ip:
+    parser.error(
+        "at least one --protected-ip is required; "
+        "the unified installer supplies it automatically"
+    )
+
+try:
+    WEB_DESTINATIONS = {
+        str(ipaddress.ip_address(value.strip()))
+        for value in args.protected_ip
+    }
+except ValueError as exc:
+    parser.error(f"invalid protected IP: {exc}")
+
+try:
+    TRUSTED_PROXIES = {
+        str(ipaddress.ip_address(value.strip()))
+        for value in args.trusted_proxy
+    }
+except ValueError as exc:
+    parser.error(f"invalid trusted proxy: {exc}")
+
+try:
+    IGNORED_SERVICES = {parse_ignore_service(value) for value in args.ignore_service}
+except (ValueError, TypeError) as exc:
+    parser.error(str(exc))
+
+model = joblib.load(MODEL_FILE)
+config = joblib.load(CONFIG_FILE)
+ACTIVE_FEATURES = list(config["active_feature_columns"])
+NUMERIC_FEATURES = list(config["active_numeric_features"])
+CATEGORICAL_FEATURES = list(config["active_categorical_features"])
+assert len(ACTIVE_FEATURES) == 40
+preprocessor = model.named_steps["preprocessor"]
+assert len(preprocessor.get_feature_names_out()) == 433
+classes = np.asarray(model.classes_)
+pos = np.where(classes == 1)[0]
+if len(pos) != 1:
+    raise RuntimeError(f"Unexpected model classes: {classes}")
+POSITIVE_INDEX = int(pos[0])
+
+DETECTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_json_line(path, data):
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
+        handle.flush()
+
+
+def is_ignored_connection(record):
+    if not IGNORED_SERVICES:
+        return False
+    orig = (str(record.get("id.orig_h") or ""), safe_int(record.get("id.orig_p")))
+    resp = (str(record.get("id.resp_h") or ""), safe_int(record.get("id.resp_p")))
+    return orig in IGNORED_SERVICES or resp in IGNORED_SERVICES
+
+
+
+XFF_RE = re.compile(
+    r"^\s*X-FORWARDED-FOR\s*->\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_ip(value):
+    if value is None:
+        return None
+
+    value = str(value).strip()
+    if not value:
+        return None
+
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+
+    # Optional IPv4:port representation.
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            try:
+                return str(ipaddress.ip_address(host))
+            except ValueError:
+                pass
+
+    return None
+
+
+def parse_xff(event):
+    proxied = event.get("proxied") or []
+    if isinstance(proxied, str):
+        proxied = [proxied]
+
+    chain = []
+
+    for item in proxied:
+        match = XFF_RE.match(str(item))
+        if not match:
+            continue
+
+        for value in match.group(1).split(","):
+            ip = normalize_ip(value)
+            if ip:
+                chain.append(ip)
+
+    return chain
+
+
+class XffResolver:
+    MAX_CACHE = 100000
+    INITIAL_SCAN_BYTES = 32 * 1024 * 1024
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.handle = None
+        self.inode = None
+        self.first_open = True
+        self.cache = OrderedDict()
+
+    def _remember(self, uid, client_ip, chain):
+        if not uid or not client_ip:
+            return
+
+        self.cache[uid] = {
+            "client_ip": client_ip,
+            "xff_chain": chain,
+        }
+        self.cache.move_to_end(uid)
+
+        while len(self.cache) > self.MAX_CACHE:
+            self.cache.popitem(last=False)
+
+    def refresh(self):
+        if not self.path.exists():
+            return
+
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return
+
+        if self.handle is None or self.inode != stat.st_ino:
+            if self.handle is not None:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+
+            self.handle = self.path.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.inode = os.fstat(self.handle.fileno()).st_ino
+
+            if self.first_open and stat.st_size > self.INITIAL_SCAN_BYTES:
+                self.handle.seek(stat.st_size - self.INITIAL_SCAN_BYTES)
+                self.handle.readline()
+
+            self.first_open = False
+
+        while True:
+            line = self.handle.readline()
+            if not line:
+                break
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            uid = str(event.get("uid") or "")
+            observed = normalize_ip(event.get("id.orig_h"))
+
+            # Never trust XFF from an arbitrary Internet host.
+            if not uid or observed not in TRUSTED_PROXIES:
+                continue
+
+            chain = parse_xff(event)
+            if not chain:
+                continue
+
+            # Walk right-to-left. Trusted infrastructure is skipped and the
+            # first non-trusted address becomes the effective client IP.
+            client_ip = None
+            for candidate in reversed(chain):
+                if candidate not in TRUSTED_PROXIES:
+                    client_ip = candidate
+                    break
+
+            if client_ip:
+                self._remember(uid, client_ip, chain)
+
+    def resolve(self, record):
+        observed = normalize_ip(record.get("id.orig_h"))
+
+        if observed not in TRUSTED_PROXIES:
+            return None
+
+        self.refresh()
+
+        uid = str(record.get("uid") or "")
+        return self.cache.get(uid)
+
+
+XFF_RESOLVER = XffResolver(HTTP_LOG)
+
+
+def enrich_source(record, result):
+    observed = normalize_ip(record.get("id.orig_h"))
+
+    result["observed_src_ip"] = observed
+    result["zeek_src_ip"] = observed
+    result["original_src_ip"] = None
+    result["source_ip_source"] = "zeek_id.orig_h"
+    result["xff_chain"] = []
+
+    resolved = XFF_RESOLVER.resolve(record)
+
+    if resolved:
+        result["src_ip"] = resolved["client_ip"]
+        result["original_src_ip"] = resolved["client_ip"]
+        result["source_ip_source"] = "x_forwarded_for"
+        result["xff_chain"] = resolved["xff_chain"]
+
+    return result
+
+
+def normalize_domain(value):
+    if value is None:
+        return None
+
+    value = str(value).strip().lower().rstrip(".")
+    if not value:
+        return None
+
+    # Zeek HTTP host can occasionally include an explicit :port suffix.
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            value = host.rstrip(".")
+
+    if not value or len(value) > 253:
+        return None
+
+    return value
+
+
+class ZeekUidDomainResolver:
+    """Tail a Zeek JSON log and cache one domain-like field by UID."""
+
+    MAX_CACHE = 100000
+    INITIAL_SCAN_BYTES = 32 * 1024 * 1024
+
+    def __init__(self, path, field, source):
+        self.path = Path(path)
+        self.field = field
+        self.source = source
+        self.handle = None
+        self.inode = None
+        self.first_open = True
+        self.cache = OrderedDict()
+
+    def _remember(self, uid, domain):
+        if not uid or not domain:
+            return
+
+        self.cache[uid] = {
+            "domain": domain,
+            "domain_source": self.source,
+        }
+        self.cache.move_to_end(uid)
+
+        while len(self.cache) > self.MAX_CACHE:
+            self.cache.popitem(last=False)
+
+    def refresh(self):
+        if not self.path.exists():
+            return
+
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return
+
+        if self.handle is None or self.inode != stat.st_ino:
+            if self.handle is not None:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+
+            self.handle = self.path.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.inode = os.fstat(self.handle.fileno()).st_ino
+
+            if self.first_open and stat.st_size > self.INITIAL_SCAN_BYTES:
+                self.handle.seek(stat.st_size - self.INITIAL_SCAN_BYTES)
+                self.handle.readline()
+
+            self.first_open = False
+
+        while True:
+            line = self.handle.readline()
+            if not line:
+                break
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            uid = str(event.get("uid") or "")
+            domain = normalize_domain(event.get(self.field))
+            if uid and domain:
+                self._remember(uid, domain)
+
+    def resolve(self, uid):
+        if not uid:
+            return None
+        self.refresh()
+        return self.cache.get(uid)
+
+
+HTTP_DOMAIN_RESOLVER = ZeekUidDomainResolver(
+    HTTP_LOG,
+    "host",
+    "zeek_http_host",
+)
+
+SSL_DOMAIN_RESOLVER = ZeekUidDomainResolver(
+    SSL_LOG,
+    "server_name",
+    "zeek_tls_sni",
+)
+
+
+def enrich_domain(record, result):
+    """Attach target website domain using the Zeek UID."""
+
+    result["domain"] = None
+    result["domain_source"] = "unresolved"
+
+    uid = str(record.get("uid") or "")
+    if not uid:
+        return result
+
+    # HTTP Host is preferred; TLS SNI is the HTTPS fallback.
+    resolved = HTTP_DOMAIN_RESOLVER.resolve(uid)
+    if not resolved:
+        resolved = SSL_DOMAIN_RESOLVER.resolve(uid)
+
+    if resolved:
+        result["domain"] = resolved["domain"]
+        result["domain_source"] = resolved["domain_source"]
+
+    return result
+
+
+def predict_connection(record):
+    X = build_features(
+        record=record,
+        active_features=ACTIVE_FEATURES,
+        numeric_features=NUMERIC_FEATURES,
+        categorical_features=CATEGORICAL_FEATURES,
+    )
+    if list(X.columns) != ACTIVE_FEATURES:
+        raise RuntimeError("Feature order mismatch")
+    probability = float(model.predict_proba(X)[0][POSITIVE_INDEX])
+    prediction = "BOTNET" if probability >= THRESHOLD else "NORMAL"
+    return {
+        "processed_at_utc": utc_now(),
+        "zeek_ts": record.get("ts"),
+        "uid": record.get("uid"),
+        "src_ip": record.get("id.orig_h"),
+        "src_port": record.get("id.orig_p"),
+        "dst_ip": record.get("id.resp_h"),
+        "dst_port": record.get("id.resp_p"),
+        "proto": record.get("proto"),
+        "service": record.get("service"),
+        "conn_state": record.get("conn_state"),
+        "history": record.get("history"),
+        "duration": record.get("duration"),
+        "orig_bytes": record.get("orig_bytes"),
+        "resp_bytes": record.get("resp_bytes"),
+        "orig_ip_bytes": record.get("orig_ip_bytes"),
+        "resp_ip_bytes": record.get("resp_ip_bytes"),
+        "traffic_bytes": (
+            safe_int(record.get("orig_ip_bytes"), 0)
+            + safe_int(record.get("resp_ip_bytes"), 0)
+        ),
+        "orig_pkts": record.get("orig_pkts"),
+        "resp_pkts": record.get("resp_pkts"),
+        "botnet_probability": round(probability, 8),
+        "threshold": THRESHOLD,
+        "prediction": prediction,
+        "detector_mode": "shadow",
+    }
+
+
+def update_attack_session(result):
+    """
+    Track one traffic session.
+
+    Every record reaching this function has already been classified
+    by Random Forest.
+
+    BOTNET records:
+      - counted as BOTNET
+      - participate in >=50 packets / rolling 1 second confirmation
+
+    NORMAL records:
+      - counted as NORMAL
+      - do NOT contribute to BOTNET confirmation
+
+    The final alert is NOT written here.
+    """
+
+    src_ip = str(result.get("src_ip") or "")
+    dst_ip = str(result.get("dst_ip") or "")
+    dst_port = safe_int(result.get("dst_port"), 0)
+
+    if not src_ip:
+        return None, "missing_source", 0, 0
+
+    if dst_ip not in WEB_DESTINATIONS or dst_port not in WEB_PORTS:
+        return None, "non_web", 0, 0
+
+    now = time.time()
+    now_utc = utc_now()
+
+    orig_pkts = safe_int(result.get("orig_pkts"), 0)
+    if orig_pkts < 0:
+        orig_pkts = 0
+
+    traffic_bytes = safe_int(result.get("traffic_bytes"), 0)
+    if traffic_bytes < 0:
+        traffic_bytes = 0
+
+    # Source port intentionally excluded.
+    # A scanner/flooder may continuously change ephemeral source ports.
+    key = (src_ip, dst_ip, dst_port)
+
+    session = ATTACK_SESSIONS.get(key)
+
+    if session is None:
+        session = {
+            "key": key,
+
+            "first_seen_monotonic": now,
+            "last_seen_monotonic": now,
+
+            "first_seen_utc": now_utc,
+            "last_seen_utc": now_utc,
+            "confirmed_at_utc": None,
+
+            "confirmed": False,
+
+            "packets_at_confirmation": 0,
+            "records_at_confirmation": 0,
+
+            "total_observed_packets": 0,
+            "botnet_packets": 0,
+            "normal_packets": 0,
+
+            "total_records": 0,
+            "botnet_records": 0,
+            "normal_records": 0,
+
+            "total_observed_bytes": 0,
+            "botnet_traffic_bytes": 0,
+            "normal_traffic_bytes": 0,
+
+            "probability_sum": 0.0,
+            "max_botnet_probability": 0.0,
+
+            "domain_packet_counts": {},
+            "domain_record_counts": {},
+            "domain_sources": {},
+
+            "first_result": dict(result),
+            "last_result": dict(result),
+        }
+
+        ATTACK_SESSIONS[key] = session
+
+    session["last_seen_monotonic"] = now
+    session["last_seen_utc"] = now_utc
+    session["last_result"] = dict(result)
+
+    # All records are included in overall traffic statistics.
+    session["total_observed_packets"] += orig_pkts
+    session["total_observed_bytes"] += traffic_bytes
+    session["total_records"] += 1
+
+    domain = normalize_domain(result.get("domain"))
+    if domain:
+        session["domain_packet_counts"][domain] = (
+            session["domain_packet_counts"].get(domain, 0) + orig_pkts
+        )
+        session["domain_record_counts"][domain] = (
+            session["domain_record_counts"].get(domain, 0) + 1
+        )
+        domain_source = str(result.get("domain_source") or "unresolved")
+        previous_source = session["domain_sources"].get(domain)
+        if previous_source != "zeek_http_host" or domain_source == "zeek_http_host":
+            session["domain_sources"][domain] = domain_source
+
+    probability = float(result.get("botnet_probability") or 0.0)
+
+    session["probability_sum"] += probability
+
+    session["max_botnet_probability"] = max(
+        session["max_botnet_probability"],
+        probability,
+    )
+
+    queue = BOTNET_PACKET_WINDOWS[key]
+
+    cutoff = now - BOTNET_PACKET_WINDOW_SECONDS
+
+    while queue and queue[0][0] < cutoff:
+        queue.popleft()
+
+    if result.get("prediction") == "BOTNET":
+
+        session["botnet_packets"] += orig_pkts
+        session["botnet_records"] += 1
+        session["botnet_traffic_bytes"] += traffic_bytes
+
+        # Only RF-positive packets are allowed to confirm BOTNET.
+        queue.append((now, orig_pkts))
+
+    else:
+
+        session["normal_packets"] += orig_pkts
+        session["normal_records"] += 1
+        session["normal_traffic_bytes"] += traffic_bytes
+
+    # Remove stale rolling-window entries.
+    cutoff = now - BOTNET_PACKET_WINDOW_SECONDS
+
+    while queue and queue[0][0] < cutoff:
+        queue.popleft()
+
+    window_packets = sum(item[1] for item in queue)
+    window_records = len(queue)
+
+    status = "tracking"
+
+    if (
+        not session["confirmed"]
+        and window_packets >= BOTNET_PACKET_THRESHOLD
+    ):
+        session["confirmed"] = True
+        session["confirmed_at_utc"] = now_utc
+
+        session["packets_at_confirmation"] = int(window_packets)
+        session["records_at_confirmation"] = int(window_records)
+
+        status = "confirmed_now"
+
+    return session, status, window_packets, window_records
+
+
+def close_attack_session(key, reason):
+    """
+    Close one traffic session.
+
+    Only sessions that previously reached the RF-positive confirmation
+    threshold are persisted to botnet_alerts.jsonl.
+    """
+
+    session = ATTACK_SESSIONS.pop(key, None)
+
+    BOTNET_PACKET_WINDOWS.pop(key, None)
+
+    if session is None:
+        return
+
+    # Normal/unconfirmed traffic must never enter the BOTNET dashboard.
+    if not session["confirmed"]:
+        return
+
+    result = dict(session["last_result"])
+
+    total_packets = int(session["total_observed_packets"])
+    botnet_packets = int(session["botnet_packets"])
+    normal_packets = int(session["normal_packets"])
+
+    total_records = int(session["total_records"])
+
+    if total_packets > 0:
+        botnet_ratio = botnet_packets / total_packets
+    else:
+        botnet_ratio = 0.0
+
+    if total_records > 0:
+        avg_probability = (
+            session["probability_sum"] / total_records
+        )
+    else:
+        avg_probability = 0.0
+
+    duration = max(
+        0.0,
+        session["last_seen_monotonic"]
+        - session["first_seen_monotonic"],
+    )
+
+    # --------------------------------------------------------
+    # Target domain summary
+    # --------------------------------------------------------
+
+    domain_counts = session["domain_packet_counts"]
+    ordered_domains = sorted(
+        domain_counts,
+        key=lambda item: (-domain_counts[item], item),
+    )
+
+    if ordered_domains:
+        result["domain"] = ordered_domains[0]
+    else:
+        result["domain"] = None
+
+    # domain_source is used internally during correlation, but the final
+    # alert intentionally adds only the domain field. Existing Filebeat
+    # host/agent metadata remains untouched for backend Agent resolution.
+    result.pop("domain_source", None)
+
+    # --------------------------------------------------------
+    # Final classification
+    # --------------------------------------------------------
+
+    result["prediction"] = "BOTNET"
+    result["confirmation_status"] = "CONFIRMED"
+    result["session_status"] = "CLOSED"
+    result["session_close_reason"] = reason
+
+    # --------------------------------------------------------
+    # Time information
+    # --------------------------------------------------------
+
+    result["first_seen_utc"] = session["first_seen_utc"]
+    result["confirmed_at_utc"] = session["confirmed_at_utc"]
+    result["last_seen_utc"] = session["last_seen_utc"]
+
+    result["attack_duration_seconds"] = round(
+        duration,
+        3,
+    )
+
+    # --------------------------------------------------------
+    # Confirmation rule information
+    # --------------------------------------------------------
+
+    result["packets_at_confirmation"] = int(
+        session["packets_at_confirmation"]
+    )
+
+    result["records_at_confirmation"] = int(
+        session["records_at_confirmation"]
+    )
+
+    result["rule_packet_threshold"] = BOTNET_PACKET_THRESHOLD
+    result["rule_window_seconds"] = BOTNET_PACKET_WINDOW_SECONDS
+
+    # Keep the original rule semantics.
+    result["rule_packets"] = int(
+        session["packets_at_confirmation"]
+    )
+
+    result["rule_records"] = int(
+        session["records_at_confirmation"]
+    )
+
+    result["rule_hits"] = int(
+        session["packets_at_confirmation"]
+    )
+
+    result["rule_min_hits"] = BOTNET_PACKET_THRESHOLD
+
+    # --------------------------------------------------------
+    # Final complete session statistics
+    # --------------------------------------------------------
+
+    result["total_observed_packets"] = total_packets
+
+    result["botnet_packets"] = botnet_packets
+    result["normal_packets"] = normal_packets
+
+    result["botnet_ratio"] = round(
+        botnet_ratio,
+        6,
+    )
+
+    result["total_records"] = total_records
+
+    result["botnet_records"] = int(
+        session["botnet_records"]
+    )
+
+    result["normal_records"] = int(
+        session["normal_records"]
+    )
+
+    # --------------------------------------------------------
+    # Traffic bytes
+    # --------------------------------------------------------
+
+    result["total_observed_bytes"] = int(
+        session["total_observed_bytes"]
+    )
+
+    result["botnet_traffic_bytes"] = int(
+        session["botnet_traffic_bytes"]
+    )
+
+    result["normal_traffic_bytes"] = int(
+        session["normal_traffic_bytes"]
+    )
+
+    # Existing dashboard compatibility.
+    result["total_traffic_bytes"] = int(
+        session["total_observed_bytes"]
+    )
+
+    result["traffic_bytes"] = int(
+        session["total_observed_bytes"]
+    )
+
+    # --------------------------------------------------------
+    # RF confidence statistics
+    # --------------------------------------------------------
+
+    result["max_botnet_probability"] = round(
+        session["max_botnet_probability"],
+        8,
+    )
+
+    result["avg_rf_probability"] = round(
+        avg_probability,
+        8,
+    )
+
+    # Existing dashboard confidence field.
+    result["botnet_probability"] = round(
+        session["max_botnet_probability"],
+        8,
+    )
+
+    result["alert_policy"] = (
+        "rf_positive_attack_session"
+    )
+
+    # --------------------------------------------------------
+    # ONLY HERE is the final session written.
+    # Filebeat will then forward it to Elasticsearch/dashboard.
+    # --------------------------------------------------------
+
+    write_json_line(ALERT_LOG, result)
+
+    print(
+        "[BOTNET][SESSION-CLOSED]",
+        f"{result.get('src_ip')} -> "
+        f"{result.get('dst_ip')}:{result.get('dst_port')}",
+        f"TOTAL={total_packets}",
+        f"BOTNET={botnet_packets}",
+        f"NORMAL={normal_packets}",
+        f"RATIO={botnet_ratio:.2%}",
+        f"DOMAIN={result.get('domain') or '-'}",
+        f"DURATION={duration:.3f}s",
+        f"REASON={reason}",
+        flush=True,
+    )
+
+
+def flush_attack_sessions():
+    """
+    Close sessions when:
+      1. no matching traffic has been seen for ATTACK_IDLE_TIMEOUT, or
+      2. the session reaches ATTACK_MAX_DURATION.
+    """
+
+    now = time.time()
+
+    for key, session in list(ATTACK_SESSIONS.items()):
+
+        idle_time = (
+            now - session["last_seen_monotonic"]
+        )
+
+        session_age = (
+            now - session["first_seen_monotonic"]
+        )
+
+        if idle_time >= ATTACK_IDLE_TIMEOUT:
+
+            close_attack_session(
+                key,
+                "idle_timeout",
+            )
+
+        elif session_age >= ATTACK_MAX_DURATION:
+
+            close_attack_session(
+                key,
+                "max_duration",
+            )
+
+def process_line(line):
+    line = line.strip()
+    if not line:
+        return
+
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as exc:
+        print("[JSON ERROR]", exc, file=sys.stderr, flush=True)
+        return
+
+    # Known infrastructure services are excluded before ML inference.
+    if is_ignored_connection(record):
+        return
+
+    try:
+        # Stage 1:
+        # Random Forest prediction remains unchanged.
+        result = predict_connection(record)
+
+        # Resolve the original client IP from X-Forwarded-For
+        # when the direct peer is a configured trusted proxy.
+        result = enrich_source(record, result)
+
+        # Correlate the target website from Zeek using the same UID.
+        result = enrich_domain(record, result)
+
+    except Exception as exc:
+        print("[PREDICTION ERROR]", repr(exc), file=sys.stderr, flush=True)
+        return
+
+    # Keep ALL predictions for forensic analysis and research,
+    # including NORMAL and unconfirmed RF-positive observations.
+    # Confirmed-only storage: intermediate predictions are not persisted.
+
+    # IMPORTANT:
+    # NORMAL observations are NOT discarded here.
+    # They are still part of the traffic session and remain counted
+    # separately from BOTNET observations.
+
+    # Never identify the trusted reverse proxy itself as the attacker.
+    # If the original client IP cannot be resolved, do not create an
+    # attack session using the trusted proxy address as the attacker.
+    if (
+        result.get("src_ip") in TRUSTED_PROXIES
+        and result.get("source_ip_source") != "x_forwarded_for"
+    ):
+        result["source_ip_source"] = "trusted_proxy_unresolved"
+
+        print(
+            "[BOTNET][PROXY-UNRESOLVED]",
+            f"{result.get('src_ip')}:{result.get('src_port')}",
+            "->",
+            f"{result.get('dst_ip')}:{result.get('dst_port')}",
+            f"P={result.get('botnet_probability', 0):.6f}",
+            "original-client-ip=unavailable",
+            flush=True,
+        )
+        return
+
+    # The production alert pipeline is limited to inbound web traffic
+    # directed to the protected server.
+    dst_ip = str(result.get("dst_ip") or "")
+    dst_port = safe_int(result.get("dst_port"), 0)
+
+    if dst_ip not in WEB_DESTINATIONS or dst_port not in WEB_PORTS:
+        print(
+            "[BOTNET][NON-WEB-SKIPPED]",
+            f"{result.get('src_ip')}:{result.get('src_port')}",
+            "->",
+            f"{dst_ip}:{dst_port}",
+            f"P={result.get('botnet_probability', 0):.6f}",
+            flush=True,
+        )
+        return
+
+    # Stage 2:
+    # Every inbound web observation has already passed through RF.
+    # BOTH BOTNET and NORMAL records now enter session tracking.
+    session, session_status, window_packets, window_records = (
+        update_attack_session(result)
+    )
+
+    if session is None:
+        return
+
+    # RF-positive observation.
+    if result["prediction"] == "BOTNET":
+
+        if session_status == "confirmed_now":
+
+            print(
+                "[BOTNET][CONFIRMED-TRACKING]",
+                f"{result.get('src_ip')}:{result.get('src_port')}",
+                "->",
+                f"{result.get('dst_ip')}:{result.get('dst_port')}",
+                f"P={result.get('botnet_probability', 0):.6f}",
+                f"WINDOW_PACKETS={window_packets}",
+                f"THRESHOLD={BOTNET_PACKET_THRESHOLD}",
+                f"RECORDS={window_records}",
+                "waiting-for-session-end",
+                flush=True,
+            )
+
+        elif not session["confirmed"]:
+
+            print(
+                "[BOTNET][PENDING]",
+                f"{result.get('src_ip')}:{result.get('src_port')}",
+                "->",
+                f"{result.get('dst_ip')}:{result.get('dst_port')}",
+                f"P={result.get('botnet_probability', 0):.6f}",
+                f"ORIG_PKTS={result.get('orig_pkts')}",
+                f"PACKETS={window_packets}/"
+                f"{BOTNET_PACKET_THRESHOLD}",
+                f"RECORDS={window_records}",
+                flush=True,
+            )
+
+        else:
+
+            print(
+                "[BOTNET][SESSION-ACTIVE]",
+                f"{result.get('src_ip')}:{result.get('src_port')}",
+                "->",
+                f"{result.get('dst_ip')}:{result.get('dst_port')}",
+                f"P={result.get('botnet_probability', 0):.6f}",
+                f"BOTNET_PACKETS={session['botnet_packets']}",
+                f"NORMAL_PACKETS={session['normal_packets']}",
+                f"TOTAL_PACKETS={session['total_observed_packets']}",
+                flush=True,
+            )
+
+def follow_conn_log(path, from_start=False):
+    handle = None
+    current_inode = None
+    first_open = True
+    waiting_printed = False
+
+    while True:
+        if not path.exists():
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                handle = None
+                current_inode = None
+            if not waiting_printed:
+                print("[WAIT] conn.log not available:", path, flush=True)
+                waiting_printed = True
+            time.sleep(1.0)
+            continue
+
+        waiting_printed = False
+        try:
+            stat = path.stat()
+        except OSError:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if handle is None or current_inode != stat.st_ino:
+            rotated = handle is not None and current_inode != stat.st_ino
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            handle = path.open("r", encoding="utf-8", errors="replace")
+            current_inode = os.fstat(handle.fileno()).st_ino
+            if first_open and not from_start:
+                handle.seek(0, os.SEEK_END)
+            first_open = False
+            print("[OPEN]", path, "inode=", current_inode, "rotated=" + str(rotated), flush=True)
+
+        line = handle.readline()
+        if line:
+            process_line(line)
+
+            # Also enforce maximum session duration while traffic continues.
+            flush_attack_sessions()
+
+            continue
+
+        try:
+            if path.stat().st_size < handle.tell():
+                handle.close()
+                handle = None
+                current_inode = None
+                continue
+        except OSError:
+            pass
+
+        # No new conn.log line:
+        # check whether a confirmed attack session has become idle.
+        flush_attack_sessions()
+
+        time.sleep(POLL_INTERVAL)
+
+
+print("=" * 80)
+print("ZEEK BOTNET DETECTOR - SHADOW MODE")
+print("=" * 80)
+print("Raw model features     :", len(ACTIVE_FEATURES))
+print("Encoded model features :", len(preprocessor.get_feature_names_out()))
+print("Threshold              :", THRESHOLD)
+print("Packet-window confirmation:", f">={BOTNET_PACKET_THRESHOLD} RF-positive packets/{BOTNET_PACKET_WINDOW_SECONDS:.0f}s")
+print("Attack idle timeout     :", f"{ATTACK_IDLE_TIMEOUT}s")
+print("Maximum session duration:", f"{ATTACK_MAX_DURATION}s")
+print("Alert delivery          : after confirmed attack session closes")
+print("Protected web targets  :", ", ".join(sorted(WEB_DESTINATIONS)))
+print("Watching conn.log      :", CONN_LOG)
+print("Domain HTTP source     :", HTTP_LOG)
+print("Domain TLS SNI source  :", SSL_LOG)
+print("Domain correlation     : HTTP host -> TLS SNI -> unresolved")
+print("Ignored services       :", ", ".join(f"{h}:{p}" for h, p in sorted(IGNORED_SERVICES)) or "none")
+print("Ignored traffic logging: DISABLED (not written to detections/alerts)")
+print("Console output         : BOTNET only")
+print("Traffic blocking       : DISABLED")
+print("=" * 80)
+
+try:
+    follow_conn_log(CONN_LOG, from_start=args.from_start)
+except KeyboardInterrupt:
+    print("Detector stopped.")
+PY_DETECTOR
+
+DETECTOR="$OUTPUT_REPO/payload/src/detector.py"
+grep -q 'BOTNET_PACKET_THRESHOLD = 50' "$DETECTOR" || die "Embedded detector missing 50-packet threshold"
+grep -q 'BOTNET_PACKET_WINDOW_SECONDS = 1.0' "$DETECTOR" || die "Embedded detector missing 1-second window"
+grep -q 'ATTACK_IDLE_TIMEOUT = 3.0' "$DETECTOR" || die "Embedded detector missing 3-second idle timeout"
+grep -q 'ATTACK_MAX_DURATION = 60.0' "$DETECTOR" || die "Embedded detector missing 60-second max session duration"
+grep -q 'def update_attack_session' "$DETECTOR" || die "Embedded detector missing attack-session tracker"
+grep -q 'def close_attack_session' "$DETECTOR" || die "Embedded detector missing session finalizer"
+grep -q -- '--protected-ip' "$DETECTOR" || die "Embedded detector missing dynamic --protected-ip support"
+grep -q -- '--ssl-log' "$DETECTOR" || die "Embedded detector missing Zeek TLS SNI domain support"
+grep -q 'class XffResolver' "$DETECTOR" || die "Embedded detector missing XFF resolver"
+grep -q 'total_observed_packets' "$DETECTOR" || die "Embedded detector missing final packet totals"
+if grep -q 'WEB_DESTINATIONS = {"' "$DETECTOR"; then
+  die "Embedded detector still contains a hard-coded protected IP"
+fi
+if grep -q 'write_json_line(DETECTION_LOG' "$DETECTOR"; then
+  die "Embedded detector is not confirmed-only"
+fi
+python3 -m py_compile "$OUTPUT_REPO/payload/src/detector.py" "$OUTPUT_REPO/payload/src/behavior_detector.py"
+
+# If the public repo does not contain model binaries, try to populate them from
+# an already deployed detector on the same host. Otherwise leave a clear warning.
+mkdir -p "$OUTPUT_REPO/payload/models"
+for model in rf_official_bro_final_pipeline.joblib zeek_official_active_feature_config.pkl; do
+  if [[ ! -s "$OUTPUT_REPO/payload/models/$model" && -s "/opt/zeek-botnet-detector/models/$model" ]]; then
+    log "Copying deployed model into unified repo: $model"
+    cp -a "/opt/zeek-botnet-detector/models/$model" "$OUTPUT_REPO/payload/models/$model"
+  fi
+done
+
+log "[6/8] Creating unified installer/verifier"
+# Preserve original v1.3.1 installer/verifier as implementation backends.
+if [[ ! -f "$OUTPUT_REPO/install-base.sh" ]]; then
+  mv "$OUTPUT_REPO/install.sh" "$OUTPUT_REPO/install-base.sh"
+fi
+if [[ -f "$OUTPUT_REPO/verify.sh" && ! -f "$OUTPUT_REPO/verify-base.sh" ]]; then
+  mv "$OUTPUT_REPO/verify.sh" "$OUTPUT_REPO/verify-base.sh"
+fi
+chmod +x "$OUTPUT_REPO/install-base.sh" "$OUTPUT_REPO/verify-base.sh" 2>/dev/null || true
+
+cat > "$OUTPUT_REPO/install.sh" <<'INSTALLER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.7.1-unified"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BASE_INSTALL="$SCRIPT_DIR/install-base.sh"
+RUNTIME_CONF="/etc/zeek-botnet-detector.conf"
+TRUSTED_PROXIES=()
+PROTECTED_IPS=()
+BASE_ARGS=()
+PURGE_PREDICTIONS=0
+SELECTED_INTERFACE=""
+INTERFACE_SOURCE="auto"
+TRUSTED_PROXY_SOURCE="none"
+PROXY_MODE="direct"
+PROXY_HEADER=""
+APACHE_REMOTEIP_CONFIG=""
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE
+SOC-BOTNET Unified Installer v$VERSION
+
+This is the single entrypoint for:
+  - base Zeek + Random Forest installation,
+  - XFF-aware botnet + behavior detection,
+  - automatic capture-interface detection (default route, then active IPv4 fallback),
+  - automatic protected destination IP detection from the selected interface,
+  - target-domain correlation from Zeek http.log Host and ssl.log TLS SNI,
+  - RF BOTNET confirmation: >=50 RF-positive packets in rolling 1 second,
+  - stateful attack-session tracking after confirmation,
+  - final alert after 3 seconds idle or 60 seconds maximum session duration,
+  - final-confirmed-session-only ML JSON storage,
+  - dedicated isolated Filebeat -> Elasticsearch.
+
+Usage:
+  sudo ./install.sh [options]
+
+Unified options:
+  --interface IFACE           Optional override. Default: auto-detect interface.
+  --protected-ip IP           Optional override. Repeatable. Default: all global
+                              IPv4 addresses on the auto-selected interface.
+  --trusted-proxy IP          Optional trusted WAF/reverse-proxy IP. Repeatable.
+                              No proxy is assumed by default. Apache/Cloudflare
+                              configuration is detected automatically for metadata.
+  --purge-predictions-log     Truncate old detections.jsonl AFTER successful install.
+  -h, --help                  Show this help plus base installer help.
+
+All normal base options are forwarded, for example:
+  --interface ens160
+  --skip-zeek-install
+  --es-host https://10.70.128.26:9200
+  --es-user elastic
+  --es-password-file /root/es.pass
+  --skip-filebeat
+
+Important:
+  --ship-all-predictions is intentionally disabled.
+  detector.py contains no hard-coded protected destination IP.
+
+Example (fully automatic interface + protected IP):
+  sudo ./install.sh \
+    --skip-zeek-install \
+    --es-host https://10.70.128.26:9200 \
+    --es-user elastic \
+    --es-password-file /root/es.pass
+
+On hosting29, if the default route uses ens32, the installer automatically
+selects ens32 and protects all global IPv4 addresses assigned to ens32.
+
+Optional manual overrides:
+  --interface ens32
+  --protected-ip 182.255.5.29
+  --trusted-proxy 10.70.184.2
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --protected-ip)
+      [[ $# -ge 2 ]] || die "--protected-ip requires IP"
+      PROTECTED_IPS+=("$2")
+      shift 2
+      ;;
+    --trusted-proxy)
+      [[ $# -ge 2 ]] || die "--trusted-proxy requires IP"
+      TRUSTED_PROXIES+=("$2")
+      TRUSTED_PROXY_SOURCE="manual"
+      shift 2
+      ;;
+    --interface)
+      [[ $# -ge 2 ]] || die "--interface requires IFACE"
+      SELECTED_INTERFACE="$2"
+      INTERFACE_SOURCE="manual"
+      BASE_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --purge-predictions-log)
+      PURGE_PREDICTIONS=1
+      shift
+      ;;
+    --ship-all-predictions)
+      die "--ship-all-predictions is disabled: unified mode stores/ships final confirmed attack sessions only"
+      ;;
+    -h|--help)
+      usage
+      echo
+      echo "---------------- Base installer options ----------------"
+      "$BASE_INSTALL" --help || true
+      exit 0
+      ;;
+    *)
+      BASE_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+[[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root: sudo ./install.sh ..."
+[[ -x "$BASE_INSTALL" ]] || die "Missing executable: $BASE_INSTALL"
+command -v ip >/dev/null 2>&1 || die "ip command not found (iproute2 is required)"
+
+log "Local interfaces (ip -br a):"
+ip -br a 2>/dev/null || true
+
+if [[ -z "$SELECTED_INTERFACE" ]]; then
+  SELECTED_INTERFACE="$(ip -4 route show default 2>/dev/null | awk '/^default / {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+
+  if [[ -n "$SELECTED_INTERFACE" ]]; then
+    INTERFACE_SOURCE="default-route"
+  else
+    # Fallback: first non-loopback UP interface that owns a global IPv4 address.
+    SELECTED_INTERFACE="$(
+      ip -o -4 addr show scope global up 2>/dev/null \
+        | awk '$2 != "lo" {print $2; exit}'
+    )"
+    [[ -n "$SELECTED_INTERFACE" ]] || die "Could not auto-detect an active IPv4 interface; pass --interface IFACE"
+    INTERFACE_SOURCE="active-ipv4-fallback"
+  fi
+fi
+
+ip link show dev "$SELECTED_INTERFACE" >/dev/null 2>&1 \
+  || die "Interface not found: $SELECTED_INTERFACE"
+
+log "Selected capture interface: $SELECTED_INTERFACE (source=$INTERFACE_SOURCE)"
+
+if [[ ${#PROTECTED_IPS[@]} -eq 0 ]]; then
+  mapfile -t PROTECTED_IPS < <(
+    ip -o -4 addr show dev "$SELECTED_INTERFACE" scope global \
+      | awk '{split($4,a,"/"); print a[1]}' \
+      | awk '!seen[$0]++'
+  )
+  [[ ${#PROTECTED_IPS[@]} -gt 0 ]] \
+    || die "No global IPv4 address found on $SELECTED_INTERFACE; use --protected-ip IP"
+  log "Auto-detected protected destination(s) from $SELECTED_INTERFACE: ${PROTECTED_IPS[*]}"
+else
+  log "Using protected destination override(s): ${PROTECTED_IPS[*]}"
+fi
+
+log "Domain metadata: Zeek http.log host -> ssl.log server_name (TLS SNI)"
+
+# ------------------------------------------------------------
+# Reverse-proxy/WAF discovery
+# ------------------------------------------------------------
+# This does NOT guess a trusted proxy from arbitrary network traffic.
+# A manual --trusted-proxy always wins. If Apache is configured with
+# mod_remoteip + CF-Connecting-IP, record Cloudflare mode but do not pass
+# Cloudflare edge networks to the Zeek XFF resolver: HTTPS headers are
+# encrypted on the wire and cannot be reliably correlated by Zeek alone.
+if [[ ${#TRUSTED_PROXIES[@]} -eq 0 ]]; then
+  APACHECTL=""
+  for candidate in apachectl apache2ctl httpd; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      APACHECTL="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$APACHECTL" ]] && "$APACHECTL" -M 2>/dev/null | grep -qi 'remoteip_module'; then
+    REMOTEIP_LINES="$(
+      grep -RhiE '^[[:space:]]*RemoteIP(Header|TrustedProxy|InternalProxy)[[:space:]]+' \
+        /etc/apache2 /etc/httpd /usr/local/apache/conf 2>/dev/null || true
+    )"
+
+    PROXY_HEADER="$(printf '%s\n' "$REMOTEIP_LINES" | awk 'tolower($1)=="remoteipheader" {print $2; exit}')"
+
+    if [[ "${PROXY_HEADER,,}" == "cf-connecting-ip" ]]; then
+      PROXY_MODE="cloudflare-apache"
+      TRUSTED_PROXY_SOURCE="apache-cloudflare-metadata"
+      APACHE_REMOTEIP_CONFIG="CF-Connecting-IP"
+      log "Detected Apache mod_remoteip with CF-Connecting-IP (Cloudflare mode)."
+      log "Cloudflare edge CIDRs are NOT passed to Zeek --trusted-proxy because HTTPS headers are encrypted on the capture interface."
+      log "Network ML detection remains active; original-client attribution should use Apache application logs if needed."
+    elif [[ "${PROXY_HEADER,,}" == "x-forwarded-for" ]]; then
+      # Only auto-import literal single IPs, never CIDRs. This keeps detector
+      # semantics precise and avoids treating an entire network as one proxy.
+      while read -r token; do
+        [[ -n "$token" ]] || continue
+        if [[ "$token" != */* ]] && python3 - "$token" <<'PY_ONE_IP' >/dev/null 2>&1
+import ipaddress, sys
+ipaddress.ip_address(sys.argv[1])
+PY_ONE_IP
+        then
+          TRUSTED_PROXIES+=("$token")
+        fi
+      done < <(
+        printf '%s\n' "$REMOTEIP_LINES" \
+          | awk 'tolower($1)=="remoteiptrustedproxy" || tolower($1)=="remoteipinternalproxy" {for(i=2;i<=NF;i++) print $i}'
+      )
+
+      if [[ ${#TRUSTED_PROXIES[@]} -gt 0 ]]; then
+        PROXY_MODE="xff"
+        TRUSTED_PROXY_SOURCE="apache-remoteip-auto"
+        log "Auto-detected trusted reverse-proxy IP(s) from Apache RemoteIP config: ${TRUSTED_PROXIES[*]}"
+      fi
+    fi
+  fi
+fi
+
+if [[ ${#TRUSTED_PROXIES[@]} -gt 0 && "$TRUSTED_PROXY_SOURCE" == "manual" ]]; then
+  PROXY_MODE="xff"
+fi
+
+python3 - "${TRUSTED_PROXIES[@]}" <<'PY_PROXY'
+import ipaddress, sys
+for value in sys.argv[1:]:
+    ipaddress.ip_address(value)
+print("Trusted proxy validation: OK (none is valid)")
+PY_PROXY
+
+python3 - "${PROTECTED_IPS[@]}" <<'PY_PROTECTED'
+import ipaddress, sys
+for value in sys.argv[1:]:
+    ipaddress.ip_address(value)
+print("Protected IP validation: OK")
+PY_PROTECTED
+
+python3 -m py_compile \
+  "$SCRIPT_DIR/payload/src/detector.py" \
+  "$SCRIPT_DIR/payload/src/behavior_detector.py"
+
+grep -q 'BOTNET_PACKET_THRESHOLD = 50' "$SCRIPT_DIR/payload/src/detector.py" \
+  || die "Unified detector payload is not the 50-packet version"
+grep -q 'BOTNET_PACKET_WINDOW_SECONDS = 1.0' "$SCRIPT_DIR/payload/src/detector.py" \
+  || die "Unified detector payload is not the 1-second window version"
+grep -q 'ATTACK_IDLE_TIMEOUT = 3.0' "$SCRIPT_DIR/payload/src/detector.py" \
+  || die "Unified detector payload is missing the 3-second idle timeout"
+grep -q 'ATTACK_MAX_DURATION = 60.0' "$SCRIPT_DIR/payload/src/detector.py" \
+  || die "Unified detector payload is missing the 60-second max session duration"
+grep -q -- '--protected-ip' "$SCRIPT_DIR/payload/src/detector.py" \
+  || die "Unified detector payload is missing dynamic protected-IP support"
+grep -q -- '--ssl-log' "$SCRIPT_DIR/payload/src/detector.py" \
+  || die "Unified detector payload is missing Zeek TLS SNI domain support"
+if grep -q 'WEB_DESTINATIONS = {"' "$SCRIPT_DIR/payload/src/detector.py"; then
+  die "Unified detector payload still hard-codes a protected destination"
+fi
+if grep -q 'write_json_line(DETECTION_LOG' "$SCRIPT_DIR/payload/src/detector.py"; then
+  die "Unified payload still persists detections.jsonl; final-session-only invariant failed"
+fi
+
+# Ensure the base installer receives the interface even when it was auto-selected.
+if [[ "$INTERFACE_SOURCE" != "manual" ]]; then
+  BASE_ARGS+=(--interface "$SELECTED_INTERFACE")
+fi
+
+log "[1/3] Running base installer with unified payload"
+(
+  cd "$SCRIPT_DIR"
+  "$BASE_INSTALL" "${BASE_ARGS[@]}"
+)
+
+[[ -r "$RUNTIME_CONF" ]] || die "Runtime config not found after base install: $RUNTIME_CONF"
+# shellcheck disable=SC1090
+source "$RUNTIME_CONF"
+
+INSTALL_DIR="${INSTALL_DIR:-/opt/zeek-botnet-detector}"
+CONN_LOG="${CONN_LOG:-/opt/zeek/logs/current/conn.log}"
+HTTP_LOG="${HTTP_LOG:-/opt/zeek/logs/current/http.log}"
+SSL_LOG="${SSL_LOG:-/opt/zeek/logs/current/ssl.log}"
+
+[[ -x "$INSTALL_DIR/venv/bin/python" ]] || die "Detector Python missing: $INSTALL_DIR/venv/bin/python"
+[[ -f "$INSTALL_DIR/src/detector.py" ]] || die "Deployed detector.py missing"
+[[ -f "$INSTALL_DIR/src/behavior_detector.py" ]] || die "Deployed behavior_detector.py missing"
+
+proxy_args=()
+for proxy in "${TRUSTED_PROXIES[@]}"; do
+  proxy_args+=(--trusted-proxy "$proxy")
+done
+
+protected_args=()
+for protected_ip in "${PROTECTED_IPS[@]}"; do
+  protected_args+=(--protected-ip "$protected_ip")
+done
+
+ignore_args=()
+if [[ -n "${IGNORE_SERVICES:-}" ]]; then
+  read -r -a _ignored <<< "$IGNORE_SERVICES"
+  for svc in "${_ignored[@]}"; do
+    [[ -n "$svc" ]] && ignore_args+=(--ignore-service "$svc")
+  done
+fi
+
+quote_cmd() {
+  local out="" arg q
+  for arg in "$@"; do
+    printf -v q '%q' "$arg"
+    out+="${out:+ }$q"
+  done
+  printf '%s' "$out"
+}
+
+ML_CMD=(
+  "$INSTALL_DIR/venv/bin/python"
+  "$INSTALL_DIR/src/detector.py"
+  --conn-log "$CONN_LOG"
+  --http-log "$HTTP_LOG"
+  --ssl-log "$SSL_LOG"
+  "${protected_args[@]}"
+  "${proxy_args[@]}"
+  "${ignore_args[@]}"
+)
+
+BEHAVIOR_CMD=(
+  "$INSTALL_DIR/venv/bin/python"
+  "$INSTALL_DIR/src/behavior_detector.py"
+  --http-log "$HTTP_LOG"
+  --conn-log "$CONN_LOG"
+  --alert-log "$INSTALL_DIR/logs/behavior_alerts.jsonl"
+  --window "${BEHAVIOR_WINDOW:-60}"
+  --http-threshold "${HTTP_THRESHOLD:-20}"
+  --ssh-threshold "${SSH_THRESHOLD:-10}"
+  --port-threshold "${PORT_THRESHOLD:-15}"
+  --host-threshold "${HOST_THRESHOLD:-15}"
+  --flood-window "${FLOOD_WINDOW:-10}"
+  --flood-threshold "${FLOOD_THRESHOLD:-100}"
+  --beacon-window "${BEACON_WINDOW:-600}"
+  --beacon-min-connections "${BEACON_MIN_CONNECTIONS:-6}"
+  --beacon-min-interval "${BEACON_MIN_INTERVAL:-5}"
+  --beacon-max-interval "${BEACON_MAX_INTERVAL:-300}"
+  --beacon-max-cv "${BEACON_MAX_CV:-0.15}"
+  --cooldown "${BEHAVIOR_COOLDOWN:-60}"
+  "${proxy_args[@]}"
+  "${ignore_args[@]}"
+)
+
+log "[2/3] Applying unified runtime service overrides"
+mkdir -p \
+  /etc/systemd/system/zeek-botnet-detector.service.d \
+  /etc/systemd/system/zeek-behavior-detector.service.d
+
+cat > /etc/systemd/system/zeek-botnet-detector.service.d/20-unified.conf <<EOF_ML
+[Service]
+ExecStart=
+ExecStart=$(quote_cmd "${ML_CMD[@]}")
+EOF_ML
+
+cat > /etc/systemd/system/zeek-behavior-detector.service.d/20-unified.conf <<EOF_BEHAVIOR
+[Service]
+ExecStart=
+ExecStart=$(quote_cmd "${BEHAVIOR_CMD[@]}")
+EOF_BEHAVIOR
+
+set_runtime_value() {
+  local key="$1" value="$2"
+  if grep -q "^${key}=" "$RUNTIME_CONF"; then
+    sed -i "s|^${key}=.*|${key}='${value}'|" "$RUNTIME_CONF"
+  else
+    printf "%s='%s'\n" "$key" "$value" >> "$RUNTIME_CONF"
+  fi
+}
+
+set_runtime_value TRUSTED_PROXIES "${TRUSTED_PROXIES[*]}"
+set_runtime_value TRUSTED_PROXY_SOURCE "$TRUSTED_PROXY_SOURCE"
+set_runtime_value PROXY_MODE "$PROXY_MODE"
+set_runtime_value PROXY_HEADER "$PROXY_HEADER"
+set_runtime_value PROTECTED_INTERFACE "$SELECTED_INTERFACE"
+set_runtime_value PROTECTED_INTERFACE_SOURCE "$INTERFACE_SOURCE"
+set_runtime_value PROTECTED_IPS "${PROTECTED_IPS[*]}"
+set_runtime_value SSL_LOG "$SSL_LOG"
+set_runtime_value DOMAIN_CORRELATION_MODE "zeek_http_host_then_tls_sni"
+
+systemctl daemon-reload
+systemctl restart zeek-botnet-detector.service zeek-behavior-detector.service
+sleep 2
+
+systemctl is-active --quiet zeek-botnet-detector.service \
+  || { journalctl -u zeek-botnet-detector.service -n 80 --no-pager; die "ML detector failed"; }
+systemctl is-active --quiet zeek-behavior-detector.service \
+  || { journalctl -u zeek-behavior-detector.service -n 80 --no-pager; die "Behavior detector failed"; }
+
+log "[3/3] Verifying final-session-only storage"
+if grep -q 'write_json_line(DETECTION_LOG' "$INSTALL_DIR/src/detector.py"; then
+  die "Deployed detector still writes detections.jsonl"
+fi
+
+if [[ "$PURGE_PREDICTIONS" -eq 1 ]]; then
+  touch "$INSTALL_DIR/logs/detections.jsonl"
+  truncate -s 0 "$INSTALL_DIR/logs/detections.jsonl"
+  log "Old detections.jsonl truncated by request"
+else
+  log "Old detections.jsonl preserved. It will no longer grow in unified mode."
+fi
+
+log "Unified installation complete"
+log "Capture interface: $SELECTED_INTERFACE (source=$INTERFACE_SOURCE)"
+log "Protected destination(s): ${PROTECTED_IPS[*]}"
+log "Proxy mode: $PROXY_MODE"
+log "Proxy header: ${PROXY_HEADER:-none}"
+log "Trusted proxies passed to Zeek resolver: ${TRUSTED_PROXIES[*]:-none}"
+log "ML rule: RF probability >=0.50 + >=50 RF-positive packets in rolling 1 second"
+log "Session close: idle 3s or maximum 60s"
+log "Persistent ML alerts: $INSTALL_DIR/logs/botnet_alerts.jsonl (final CONFIRMED sessions only)"
+log "Intermediate NORMAL/PENDING/ACTIVE ML events: not persisted to detections.jsonl"
+log "Behavior alerts: $INSTALL_DIR/logs/behavior_alerts.jsonl"
+log "Run: sudo ./verify.sh"
+INSTALLER
+chmod +x "$OUTPUT_REPO/install.sh"
+
+cat > "$OUTPUT_REPO/verify.sh" <<'VERIFY'
+#!/usr/bin/env bash
+set -u
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="/opt/zeek-botnet-detector"
+RUNTIME_CONF="/etc/zeek-botnet-detector.conf"
+FAIL=0
+ok() { printf '[OK] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*"; }
+fail() { printf '[FAIL] %s\n' "$*"; FAIL=$((FAIL+1)); }
+
+if [[ -x "$SCRIPT_DIR/verify-base.sh" ]]; then
+  "$SCRIPT_DIR/verify-base.sh" || FAIL=$((FAIL+1))
+fi
+
+echo "============================================================"
+echo " SOC-BOTNET unified v1.7.1 checks"
+echo "============================================================"
+
+D="$INSTALL_DIR/src/detector.py"
+B="$INSTALL_DIR/src/behavior_detector.py"
+
+[[ -f "$D" ]] || fail "detector.py missing"
+[[ -f "$B" ]] || fail "behavior_detector.py missing"
+
+if [[ -f "$D" ]]; then
+  grep -q 'BOTNET_PACKET_THRESHOLD = 50' "$D" && ok "50-packet RF-positive confirmation threshold" || fail "50-packet threshold missing"
+  grep -q 'BOTNET_PACKET_WINDOW_SECONDS = 1.0' "$D" && ok "1-second rolling window" || fail "1-second window missing"
+  grep -q 'ATTACK_IDLE_TIMEOUT = 3.0' "$D" && ok "3-second attack-session idle timeout" || fail "idle timeout missing"
+  grep -q 'ATTACK_MAX_DURATION = 60.0' "$D" && ok "60-second maximum attack-session duration" || fail "max session duration missing"
+  grep -q 'def update_attack_session' "$D" && ok "RF attack-session tracker present" || fail "attack-session tracker missing"
+  grep -q 'def close_attack_session' "$D" && ok "Final session summary present" || fail "session finalizer missing"
+  grep -q -- '--protected-ip' "$D" && ok "Dynamic protected destination CLI present" || fail "--protected-ip missing"
+  grep -q 'class XffResolver' "$D" && ok "RF detector XFF resolver present" || fail "RF XFF resolver missing"
+  grep -q 'total_observed_packets' "$D" && ok "Final packet totals present" || fail "final packet totals missing"
+  if grep -q 'WEB_DESTINATIONS = {"' "$D"; then
+    fail "detector.py still hard-codes a protected destination IP"
+  else
+    ok "No hard-coded protected destination IP"
+  fi
+  if grep -q 'write_json_line(DETECTION_LOG' "$D"; then
+    fail "detector.py still persists intermediate detections.jsonl"
+  else
+    ok "Final-session-only ML storage enabled"
+  fi
+fi
+
+if [[ -f "$B" ]]; then
+  grep -q 'X-FORWARDED-FOR' "$B" && ok "Behavior detector XFF support present" || fail "Behavior XFF support missing"
+  grep -q -- '--trusted-proxy' "$B" && ok "Behavior trusted-proxy CLI present" || fail "Behavior trusted-proxy CLI missing"
+fi
+
+ML_UNIT="$(systemctl cat zeek-botnet-detector.service 2>/dev/null || true)"
+BEHAVIOR_UNIT="$(systemctl cat zeek-behavior-detector.service 2>/dev/null || true)"
+
+if grep -q -- '--protected-ip' <<< "$ML_UNIT"; then
+  ok "ML service receives protected destination configuration"
+else
+  fail "ML service has no --protected-ip argument"
+fi
+
+if grep -q -- '--ssl-log' <<< "$ML_UNIT"; then
+  ok "ML service receives Zeek ssl.log for TLS SNI domain correlation"
+else
+  fail "ML service has no --ssl-log argument"
+fi
+
+if grep -q -- '--trusted-proxy' <<< "$ML_UNIT"; then
+  ok "ML service receives trusted proxy configuration"
+else
+  fail "ML service has no --trusted-proxy argument"
+fi
+
+if grep -q -- '--trusted-proxy' <<< "$BEHAVIOR_UNIT"; then
+  ok "Behavior service receives trusted proxy configuration"
+else
+  fail "Behavior service has no --trusted-proxy argument"
+fi
+
+if [[ -r "$RUNTIME_CONF" ]]; then
+  grep -q '^PROTECTED_INTERFACE=' "$RUNTIME_CONF" && ok "Protected interface recorded" || fail "Protected interface not recorded"
+  grep -q '^PROTECTED_IPS=' "$RUNTIME_CONF" && ok "Protected IP(s) recorded" || fail "Protected IP(s) not recorded"
+else
+  fail "Runtime configuration missing: $RUNTIME_CONF"
+fi
+
+if systemctl is-active --quiet zeek-botnet-detector.service; then ok "zeek-botnet-detector.service active"; else fail "ML service inactive"; fi
+if systemctl is-active --quiet zeek-behavior-detector.service; then ok "zeek-behavior-detector.service active"; else fail "Behavior service inactive"; fi
+
+if [[ -f /etc/filebeat-botnet/filebeat.yml ]]; then
+  if grep -q 'botnet_alerts.jsonl' /etc/filebeat-botnet/filebeat.yml; then ok "Dedicated Filebeat ships final botnet alerts"; else fail "botnet alert input missing from Filebeat"; fi
+  if grep -q 'detections.jsonl' /etc/filebeat-botnet/filebeat.yml; then
+    fail "Dedicated Filebeat still ships detections.jsonl"
+  else
+    ok "Dedicated Filebeat does not ship intermediate predictions"
+  fi
+else
+  warn "Dedicated Filebeat config absent (possibly installed with --skip-filebeat)"
+fi
+
+if [[ "$FAIL" -eq 0 ]]; then
+  echo "Unified verification: PASS"
+  exit 0
+fi
+
+echo "Unified verification: FAIL ($FAIL check(s))"
+exit 1
+VERIFY
+chmod +x "$OUTPUT_REPO/verify.sh"
+
+cat > "$OUTPUT_REPO/VERSION" <<'EOF_VERSION'
+1.7.1-unified
+EOF_VERSION
+
+cat > "$OUTPUT_REPO/UNIFIED.md" <<'DOC'
+# SOC-BOTNET Unified v1.7.1
+
+This repository combines the base SOC-BOTNET installer, the XFF update, and the
+latest Random Forest attack-session detector.
+
+## Current ML behavior
+
+- Random Forest threshold: `0.50`.
+- Protected destination IP: **not hard-coded** in `detector.py`.
+- `install.sh` automatically detects the capture interface (normally from the default route) and then all protected global IPv4 address(es) on that interface.
+- Target website metadata is correlated by Zeek UID: `http.log.host` first, then `ssl.log.server_name` (TLS SNI), and the final alert adds only `domain`.
+- Optional overrides: `--interface IFACE`, `--protected-ip IP` (repeatable), and `--trusted-proxy IP` (repeatable).
+- Confirmation rule: at least `50` RF-positive `orig_pkts` in a rolling `1 second` window.
+- Every Zeek connection record continues through Random Forest during the session.
+- RF `BOTNET` and `NORMAL` packet totals are tracked separately.
+- Session closes after `3 seconds` idle or `60 seconds` maximum duration.
+- Only the final CONFIRMED session summary is written to `botnet_alerts.jsonl`.
+- `detections.jsonl` is not used for new intermediate predictions.
+- X-Forwarded-For is trusted only from configured trusted proxy IPs.
+
+## Automatic domain metadata
+
+Final BOTNET alerts add only `domain` as new target metadata. Existing Filebeat/backend `agent.name` / `host.hostname` / `host.name` / `hostname` metadata is left unchanged for the current Agent column. Domain correlation uses the Zeek connection UID and prefers `http.log.host`; for HTTPS it falls back to `ssl.log.server_name` (TLS SNI). If neither source is available, `domain` remains null rather than being guessed.
+
+## Automatic protected destination
+
+Normal installation requires no manual destination-IP edit:
+
+```bash
+sudo ./install.sh \
+  --interface ens160 \
+  --skip-zeek-install \
+  --trusted-proxy 10.70.184.2 \
+  --es-password-file /root/es.pass
+```
+
+If `ens160` owns `10.70.184.24`, the installer automatically starts the ML service with `--protected-ip 10.70.184.24`.
+On another VM, such as `enp0s3` with `10.69.15.127`, it automatically uses `--protected-ip 10.69.15.127`.
+
+Manual override remains available for multi-address/VIP systems:
+
+```bash
+sudo ./install.sh \
+  --interface ens160 \
+  --protected-ip 10.70.184.24 \
+  --skip-zeek-install \
+  --es-password-file /root/es.pass
+```
+
+## Final alert fields
+
+The final session JSON includes `domain`, `packets_at_confirmation`, `total_observed_packets`,
+`botnet_packets`, `normal_packets`, `botnet_ratio`, record counts, traffic bytes,
+`attack_duration_seconds`, and `session_close_reason`. Existing Agent/host fields remain provided by the current Filebeat/backend pipeline.
+
+## Verify
+
+```bash
+sudo ./verify.sh
+sudo systemctl status zeek-botnet-detector.service --no-pager
+sudo journalctl -u zeek-botnet-detector.service -n 30 --no-pager
+```
+
+## Push branch
+
+The builder keeps the `.git` history from SOC-BOTNET and creates `unified-v1.7.1` by default:
+
+```bash
+cd ~/SOC-BOTNET-UNIFIED
+git status
+git add .
+git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
+git push -u origin unified-v1.7.1
+```
+DOC
+
+# Remove stale Python cache copied from a working tree, if any.
+find "$OUTPUT_REPO" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+
+# Clean executable bits on Python payloads and make scripts executable.
+chmod 0644 "$OUTPUT_REPO/payload/src/detector.py" "$OUTPUT_REPO/payload/src/behavior_detector.py"
+chmod +x "$OUTPUT_REPO/install.sh" "$OUTPUT_REPO/install-base.sh" "$OUTPUT_REPO/verify.sh" "$OUTPUT_REPO/verify-base.sh" 2>/dev/null || true
+
+
+
+log "[7/8] Cleaning generated working tree"
+find "$OUTPUT_REPO" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+find "$OUTPUT_REPO" -type f \( -name '*.pyc' -o -name '*.bak.*' \) -delete 2>/dev/null || true
+
+# Make the generated tree belong to the invoking user when the builder was run with sudo.
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+  chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$OUTPUT_REPO" 2>/dev/null || true
+fi
+
+log "[8/8] Preparing Git branch"
+if [[ "$NO_BRANCH" -eq 0 ]]; then
+  (
+    cd "$OUTPUT_REPO"
+    # Refuse to overwrite an existing local branch name.
+    if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+      die "Local branch already exists in output: $BRANCH"
+    fi
+    git switch -c "$BRANCH" >/dev/null
+  )
+  log "Created branch: $BRANCH"
+else
+  log "Branch creation skipped (--no-branch)"
+fi
+
+MODEL_OK=1
+for model in rf_official_bro_final_pipeline.joblib zeek_official_active_feature_config.pkl; do
+  if [[ ! -s "$OUTPUT_REPO/payload/models/$model" ]]; then
+    log "WARNING: model file missing: payload/models/$model"
+    MODEL_OK=0
+  fi
+done
+
+cat <<EOF_SUMMARY
+
+======================================================================
+SOC-BOTNET UNIFIED BUILD COMPLETE
+======================================================================
+Output : $OUTPUT_REPO
+Branch : $([[ "$NO_BRANCH" -eq 0 ]] && printf '%s' "$BRANCH" || printf '(not created)')
+
+Final detector policy:
+  - Random Forest threshold : 0.50
+  - Packet threshold        : >= 50 RF-positive packets
+  - Rolling window          : 1 second
+  - Attack idle timeout     : 3 seconds
+  - Max session duration    : 60 seconds
+  - Protected destination  : auto-detected from install interface
+  - XFF trusted-proxy       : optional/manual or Apache RemoteIP auto-detect
+  - Cloudflare/Apache mode   : auto-detected (no false Zeek XFF claim on HTTPS)
+  - Persistent ML log       : final CONFIRMED sessions only
+  - detections.jsonl        : no new intermediate events
+  - Domain field             : Zeek HTTP Host -> TLS SNI fallback
+  - Agent/host metadata      : preserved from existing Filebeat/backend pipeline
+  - Final packet totals      : BOTNET + NORMAL + total observed
+
+Next Git commands:
+  cd "$OUTPUT_REPO"
+  git status
+  git diff --stat
+  git add .
+  git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
+  git push -u origin "$BRANCH"
+EOF_SUMMARY
+
+if [[ "$MODEL_OK" -eq 0 ]]; then
+  cat <<'EOF_MODEL'
+
+IMPORTANT:
+The unified source repo was built, but one or both model binaries were not
+available from GitHub or /opt/zeek-botnet-detector/models. Before installing,
+place these files under payload/models/:
+  rf_official_bro_final_pipeline.joblib
+  zeek_official_active_feature_config.pkl
+EOF_MODEL
+fi
