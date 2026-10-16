@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# SOC-BOTNET Standalone Builder v1.7.1
+# SOC-BOTNET Standalone Builder v1.7.2
 # One file: automatically clones SOC-BOTNET + SOC-BOTNET-UPDATE,
 # embeds the latest stateful RF detector, applies XFF overlay, and creates a ready-to-review
 # SOC-BOTNET-UNIFIED Git working tree. Capture interface and protected destination IPs are detected automatically at install time.
 
 BASE_URL="https://github.com/YosuaKev/SOC-BOTNET.git"
 UPDATE_URL="https://github.com/YosuaKev/SOC-BOTNET-UPDATE.git"
-BRANCH="unified-v1.7.1"
+BRANCH="unified-v1.7.2"
 FORCE=0
 NO_BRANCH=0
 
@@ -22,7 +22,7 @@ OUTPUT_REPO="$INVOKING_HOME/SOC-BOTNET-UNIFIED"
 
 usage() {
   cat <<'USAGE'
-SOC-BOTNET Standalone Builder v1.7.1
+SOC-BOTNET Standalone Builder v1.7.2
 
 This ONE script automatically:
   1. clones https://github.com/YosuaKev/SOC-BOTNET
@@ -33,7 +33,7 @@ This ONE script automatically:
   6. correlates target domain from Zeek http.log Host / ssl.log TLS SNI
   7. preserves the existing Filebeat/backend Agent/host metadata unchanged
   8. enforces final-CONFIRMED-session-only ML storage
-  9. creates unified install.sh + verify.sh and branch unified-v1.7.1
+  9. creates unified install.sh + verify.sh and branch unified-v1.7.2
 
 No manual git clone is required.
 No /opt/zeek-botnet-detector/src/detector.py is required to BUILD the repo.
@@ -43,7 +43,7 @@ Usage:
 
 Options:
   --output PATH      Output repository. Default: ~/SOC-BOTNET-UNIFIED
-  --branch NAME      Git branch to create. Default: unified-v1.7.1
+  --branch NAME      Git branch to create. Default: unified-v1.7.2
   --no-branch        Do not create a new Git branch
   --force            Replace existing output directory
   -h, --help         Show help
@@ -54,7 +54,7 @@ After build:
   git diff --stat
   git add .
   git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
-  git push -u origin unified-v1.7.1
+  git push -u origin unified-v1.7.2
 USAGE
 }
 
@@ -131,6 +131,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import time
 from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timezone
@@ -255,11 +256,64 @@ CONN_LOG = Path(args.conn_log)
 HTTP_LOG = Path(args.http_log)
 SSL_LOG = Path(args.ssl_log)
 
-if not args.protected_ip:
-    parser.error(
-        "at least one --protected-ip is required; "
-        "the unified installer supplies it automatically"
+def auto_detect_protected_ips():
+    """Best-effort fallback for legacy/base service units missing --protected-ip."""
+    ip_bin = next(
+        (candidate for candidate in ("/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip") if Path(candidate).exists()),
+        "ip",
     )
+    try:
+        route = subprocess.run(
+            [ip_bin, "-4", "route", "show", "default"],
+            check=False, capture_output=True, text=True, timeout=3,
+        ).stdout
+        interface = ""
+        fields = route.split()
+        if "dev" in fields:
+            idx = fields.index("dev")
+            if idx + 1 < len(fields):
+                interface = fields[idx + 1]
+
+        cmd = [ip_bin, "-o", "-4", "addr", "show"]
+        if interface:
+            cmd.extend(["dev", interface])
+        cmd.extend(["scope", "global"])
+        output = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=3,
+        ).stdout
+
+        detected = []
+        for line in output.splitlines():
+            parts = line.split()
+            if "inet" not in parts:
+                continue
+            idx = parts.index("inet")
+            if idx + 1 >= len(parts):
+                continue
+            value = parts[idx + 1].split("/", 1)[0]
+            try:
+                value = str(ipaddress.ip_address(value))
+            except ValueError:
+                continue
+            if value not in detected:
+                detected.append(value)
+        return detected
+    except Exception as exc:
+        print(f"[WARN] protected-IP auto-detection failed: {exc}", file=sys.stderr, flush=True)
+        return []
+
+
+if not args.protected_ip:
+    args.protected_ip = auto_detect_protected_ips()
+    if args.protected_ip:
+        print(
+            "[AUTO] Protected destination(s): " + ", ".join(args.protected_ip),
+            flush=True,
+        )
+    else:
+        parser.error(
+            "no --protected-ip supplied and automatic local IPv4 detection failed"
+        )
 
 try:
     WEB_DESTINATIONS = {
@@ -1344,7 +1398,7 @@ cat > "$OUTPUT_REPO/install.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.7.1-unified"
+VERSION="1.7.2-unified"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_INSTALL="$SCRIPT_DIR/install-base.sh"
 RUNTIME_CONF="/etc/zeek-botnet-detector.conf"
@@ -1358,65 +1412,63 @@ TRUSTED_PROXY_SOURCE="none"
 PROXY_MODE="direct"
 PROXY_HEADER=""
 APACHE_REMOTEIP_CONFIG=""
+SKIP_FILEBEAT=0
+ES_HOST="https://10.70.128.26:9200"
+ES_USER="elastic"
+ES_PASSWORD_FILE=""
+ES_PASSWORD_FILE_IS_TEMP=0
+BASE_RC=0
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
+
+cleanup() {
+  if [[ "$ES_PASSWORD_FILE_IS_TEMP" -eq 1 && -n "${ES_PASSWORD_FILE:-}" ]]; then
+    rm -f -- "$ES_PASSWORD_FILE" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 usage() {
   cat <<USAGE
 SOC-BOTNET Unified Installer v$VERSION
 
-This is the single entrypoint for:
-  - base Zeek + Random Forest installation,
-  - XFF-aware botnet + behavior detection,
-  - automatic capture-interface detection (default route, then active IPv4 fallback),
-  - automatic protected destination IP detection from the selected interface,
-  - target-domain correlation from Zeek http.log Host and ssl.log TLS SNI,
-  - RF BOTNET confirmation: >=50 RF-positive packets in rolling 1 second,
-  - stateful attack-session tracking after confirmation,
-  - final alert after 3 seconds idle or 60 seconds maximum session duration,
-  - final-confirmed-session-only ML JSON storage,
+Single-entry installation for:
+  - Zeek + Random Forest botnet detection,
+  - automatic capture-interface and protected-IP detection,
+  - target-domain correlation from Zeek HTTP Host / TLS SNI,
+  - stateful RF attack-session confirmation,
+  - behavior detection,
   - dedicated isolated Filebeat -> Elasticsearch.
 
 Usage:
   sudo ./install.sh [options]
 
-Unified options:
-  --interface IFACE           Optional override. Default: auto-detect interface.
-  --protected-ip IP           Optional override. Repeatable. Default: all global
-                              IPv4 addresses on the auto-selected interface.
-  --trusted-proxy IP          Optional trusted WAF/reverse-proxy IP. Repeatable.
-                              No proxy is assumed by default. Apache/Cloudflare
-                              configuration is detected automatically for metadata.
-  --purge-predictions-log     Truncate old detections.jsonl AFTER successful install.
-  -h, --help                  Show this help plus base installer help.
+Common options:
+  --interface IFACE           Optional override. Default: auto-detect.
+  --protected-ip IP           Optional override. Repeatable. Default: every global
+                              IPv4 on the selected capture interface.
+  --trusted-proxy IP          Optional trusted reverse-proxy/WAF IP. Repeatable.
+  --es-host URL               Elasticsearch URL.
+                              Default: https://10.70.128.26:9200
+  --es-user USER              Elasticsearch username. Default: elastic
+  --es-password-file FILE     Optional non-interactive password file.
+                              If omitted, installer securely prompts for the
+                              Elasticsearch password and stores it in the dedicated
+                              Filebeat keystore (not in filebeat.yml).
+  --skip-filebeat             Do not configure the dedicated botnet Filebeat service.
+  --purge-predictions-log     Truncate old detections.jsonl after successful install.
+  -h, --help                  Show this help plus base-installer help.
 
-All normal base options are forwarded, for example:
-  --interface ens160
-  --skip-zeek-install
-  --es-host https://10.70.128.26:9200
-  --es-user elastic
-  --es-password-file /root/es.pass
-  --skip-filebeat
+Recommended interactive installation:
+  sudo ./install.sh \\
+    --es-host https://10.70.128.26:9200 \\
+    --es-user elastic
 
-Important:
-  --ship-all-predictions is intentionally disabled.
-  detector.py contains no hard-coded protected destination IP.
+The installer will display:
+  Elasticsearch password for elastic:
 
-Example (fully automatic interface + protected IP):
-  sudo ./install.sh \
-    --skip-zeek-install \
-    --es-host https://10.70.128.26:9200 \
-    --es-user elastic \
-    --es-password-file /root/es.pass
-
-On hosting29, if the default route uses ens32, the installer automatically
-selects ens32 and protects all global IPv4 addresses assigned to ens32.
-
-Optional manual overrides:
-  --interface ens32
-  --protected-ip 182.255.5.29
-  --trusted-proxy 10.70.184.2
+Type the password and press Enter. Input is hidden.
 USAGE
 }
 
@@ -1440,12 +1492,32 @@ while [[ $# -gt 0 ]]; do
       BASE_ARGS+=("$1" "$2")
       shift 2
       ;;
+    --es-host)
+      [[ $# -ge 2 ]] || die "--es-host requires URL"
+      ES_HOST="$2"
+      shift 2
+      ;;
+    --es-user)
+      [[ $# -ge 2 ]] || die "--es-user requires USER"
+      ES_USER="$2"
+      shift 2
+      ;;
+    --es-password-file)
+      [[ $# -ge 2 ]] || die "--es-password-file requires FILE"
+      ES_PASSWORD_FILE="$2"
+      shift 2
+      ;;
+    --skip-filebeat)
+      SKIP_FILEBEAT=1
+      BASE_ARGS+=("$1")
+      shift
+      ;;
     --purge-predictions-log)
       PURGE_PREDICTIONS=1
       shift
       ;;
     --ship-all-predictions)
-      die "--ship-all-predictions is disabled: unified mode stores/ships final confirmed attack sessions only"
+      die "--ship-all-predictions is disabled: unified mode ships final confirmed sessions only"
       ;;
     -h|--help)
       usage
@@ -1465,6 +1537,34 @@ done
 [[ -x "$BASE_INSTALL" ]] || die "Missing executable: $BASE_INSTALL"
 command -v ip >/dev/null 2>&1 || die "ip command not found (iproute2 is required)"
 
+# Elasticsearch authentication: interactive by default.
+if [[ "$SKIP_FILEBEAT" -eq 0 ]]; then
+  if [[ -n "$ES_PASSWORD_FILE" ]]; then
+    [[ -r "$ES_PASSWORD_FILE" && -s "$ES_PASSWORD_FILE" ]] \
+      || die "Cannot read or empty --es-password-file: $ES_PASSWORD_FILE"
+    log "Using Elasticsearch password file: $ES_PASSWORD_FILE"
+  else
+    [[ -r /dev/tty && -w /dev/tty ]] \
+      || die "Interactive password prompt unavailable; use --es-password-file FILE"
+    printf 'Elasticsearch password for %s: ' "$ES_USER" >/dev/tty
+    IFS= read -r -s ES_PASSWORD </dev/tty || die "Could not read Elasticsearch password"
+    printf '\n' >/dev/tty
+    [[ -n "$ES_PASSWORD" ]] || die "Elasticsearch password cannot be empty"
+
+    PASS_TMP_DIR="/run"
+    [[ -d "$PASS_TMP_DIR" && -w "$PASS_TMP_DIR" ]] || PASS_TMP_DIR="/tmp"
+    ES_PASSWORD_FILE="$(mktemp "$PASS_TMP_DIR/soc-botnet-es-pass.XXXXXX")"
+    ES_PASSWORD_FILE_IS_TEMP=1
+    chmod 600 "$ES_PASSWORD_FILE"
+    printf '%s' "$ES_PASSWORD" > "$ES_PASSWORD_FILE"
+    unset ES_PASSWORD
+    log "Elasticsearch password captured securely for installation"
+  fi
+
+  # Always pass explicit ES settings to the base installer.
+  BASE_ARGS+=(--es-host "$ES_HOST" --es-user "$ES_USER" --es-password-file "$ES_PASSWORD_FILE")
+fi
+
 log "Local interfaces (ip -br a):"
 ip -br a 2>/dev/null || true
 
@@ -1474,7 +1574,6 @@ if [[ -z "$SELECTED_INTERFACE" ]]; then
   if [[ -n "$SELECTED_INTERFACE" ]]; then
     INTERFACE_SOURCE="default-route"
   else
-    # Fallback: first non-loopback UP interface that owns a global IPv4 address.
     SELECTED_INTERFACE="$(
       ip -o -4 addr show scope global up 2>/dev/null \
         | awk '$2 != "lo" {print $2; exit}'
@@ -1486,7 +1585,6 @@ fi
 
 ip link show dev "$SELECTED_INTERFACE" >/dev/null 2>&1 \
   || die "Interface not found: $SELECTED_INTERFACE"
-
 log "Selected capture interface: $SELECTED_INTERFACE (source=$INTERFACE_SOURCE)"
 
 if [[ ${#PROTECTED_IPS[@]} -eq 0 ]]; then
@@ -1497,21 +1595,14 @@ if [[ ${#PROTECTED_IPS[@]} -eq 0 ]]; then
   )
   [[ ${#PROTECTED_IPS[@]} -gt 0 ]] \
     || die "No global IPv4 address found on $SELECTED_INTERFACE; use --protected-ip IP"
-  log "Auto-detected protected destination(s) from $SELECTED_INTERFACE: ${PROTECTED_IPS[*]}"
+  log "Auto-detected protected destination(s): ${PROTECTED_IPS[*]}"
 else
   log "Using protected destination override(s): ${PROTECTED_IPS[*]}"
 fi
 
 log "Domain metadata: Zeek http.log host -> ssl.log server_name (TLS SNI)"
 
-# ------------------------------------------------------------
-# Reverse-proxy/WAF discovery
-# ------------------------------------------------------------
-# This does NOT guess a trusted proxy from arbitrary network traffic.
-# A manual --trusted-proxy always wins. If Apache is configured with
-# mod_remoteip + CF-Connecting-IP, record Cloudflare mode but do not pass
-# Cloudflare edge networks to the Zeek XFF resolver: HTTPS headers are
-# encrypted on the wire and cannot be reliably correlated by Zeek alone.
+# Reverse-proxy/WAF discovery. Manual --trusted-proxy always wins.
 if [[ ${#TRUSTED_PROXIES[@]} -eq 0 ]]; then
   APACHECTL=""
   for candidate in apachectl apache2ctl httpd; do
@@ -1526,19 +1617,15 @@ if [[ ${#TRUSTED_PROXIES[@]} -eq 0 ]]; then
       grep -RhiE '^[[:space:]]*RemoteIP(Header|TrustedProxy|InternalProxy)[[:space:]]+' \
         /etc/apache2 /etc/httpd /usr/local/apache/conf 2>/dev/null || true
     )"
-
     PROXY_HEADER="$(printf '%s\n' "$REMOTEIP_LINES" | awk 'tolower($1)=="remoteipheader" {print $2; exit}')"
 
     if [[ "${PROXY_HEADER,,}" == "cf-connecting-ip" ]]; then
       PROXY_MODE="cloudflare-apache"
       TRUSTED_PROXY_SOURCE="apache-cloudflare-metadata"
       APACHE_REMOTEIP_CONFIG="CF-Connecting-IP"
-      log "Detected Apache mod_remoteip with CF-Connecting-IP (Cloudflare mode)."
-      log "Cloudflare edge CIDRs are NOT passed to Zeek --trusted-proxy because HTTPS headers are encrypted on the capture interface."
-      log "Network ML detection remains active; original-client attribution should use Apache application logs if needed."
+      log "Detected Apache mod_remoteip with CF-Connecting-IP (Cloudflare mode)"
+      log "Cloudflare CIDRs are not passed to Zeek XFF resolver; HTTPS headers are encrypted on the capture interface"
     elif [[ "${PROXY_HEADER,,}" == "x-forwarded-for" ]]; then
-      # Only auto-import literal single IPs, never CIDRs. This keeps detector
-      # semantics precise and avoids treating an entire network as one proxy.
       while read -r token; do
         [[ -n "$token" ]] || continue
         if [[ "$token" != */* ]] && python3 - "$token" <<'PY_ONE_IP' >/dev/null 2>&1
@@ -1552,11 +1639,10 @@ PY_ONE_IP
         printf '%s\n' "$REMOTEIP_LINES" \
           | awk 'tolower($1)=="remoteiptrustedproxy" || tolower($1)=="remoteipinternalproxy" {for(i=2;i<=NF;i++) print $i}'
       )
-
       if [[ ${#TRUSTED_PROXIES[@]} -gt 0 ]]; then
         PROXY_MODE="xff"
         TRUSTED_PROXY_SOURCE="apache-remoteip-auto"
-        log "Auto-detected trusted reverse-proxy IP(s) from Apache RemoteIP config: ${TRUSTED_PROXIES[*]}"
+        log "Auto-detected trusted reverse-proxy IP(s): ${TRUSTED_PROXIES[*]}"
       fi
     fi
   fi
@@ -1570,7 +1656,7 @@ python3 - "${TRUSTED_PROXIES[@]}" <<'PY_PROXY'
 import ipaddress, sys
 for value in sys.argv[1:]:
     ipaddress.ip_address(value)
-print("Trusted proxy validation: OK (none is valid)")
+print("Trusted proxy validation: OK")
 PY_PROXY
 
 python3 - "${PROTECTED_IPS[@]}" <<'PY_PROTECTED'
@@ -1595,37 +1681,48 @@ grep -q 'ATTACK_MAX_DURATION = 60.0' "$SCRIPT_DIR/payload/src/detector.py" \
 grep -q -- '--protected-ip' "$SCRIPT_DIR/payload/src/detector.py" \
   || die "Unified detector payload is missing dynamic protected-IP support"
 grep -q -- '--ssl-log' "$SCRIPT_DIR/payload/src/detector.py" \
-  || die "Unified detector payload is missing Zeek TLS SNI domain support"
+  || die "Unified detector payload is missing TLS SNI domain support"
 if grep -q 'WEB_DESTINATIONS = {"' "$SCRIPT_DIR/payload/src/detector.py"; then
   die "Unified detector payload still hard-codes a protected destination"
 fi
 if grep -q 'write_json_line(DETECTION_LOG' "$SCRIPT_DIR/payload/src/detector.py"; then
-  die "Unified payload still persists detections.jsonl; final-session-only invariant failed"
+  die "Unified payload still persists detections.jsonl"
 fi
 
-# Ensure the base installer receives the interface even when it was auto-selected.
 if [[ "$INTERFACE_SOURCE" != "manual" ]]; then
   BASE_ARGS+=(--interface "$SELECTED_INTERFACE")
 fi
 
-log "[1/3] Running base installer with unified payload"
+log "[1/4] Running base installer"
+set +e
 (
   cd "$SCRIPT_DIR"
   "$BASE_INSTALL" "${BASE_ARGS[@]}"
 )
+BASE_RC=$?
+set -e
 
+if [[ "$BASE_RC" -ne 0 ]]; then
+  log "Base installer returned status $BASE_RC; checking whether core deployment completed so unified finalization can recover it"
+fi
+
+# The historical base installer can exit while starting the ML service before
+# the unified --protected-ip override is written. Continue only when all core
+# deployment artifacts exist; otherwise treat the base failure as real.
 [[ -r "$RUNTIME_CONF" ]] || die "Runtime config not found after base install: $RUNTIME_CONF"
 # shellcheck disable=SC1090
 source "$RUNTIME_CONF"
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/zeek-botnet-detector}"
-CONN_LOG="${CONN_LOG:-/opt/zeek/logs/current/conn.log}"
-HTTP_LOG="${HTTP_LOG:-/opt/zeek/logs/current/http.log}"
-SSL_LOG="${SSL_LOG:-/opt/zeek/logs/current/ssl.log}"
+CONN_LOG="${CONN_LOG:-/var/log/zeek/logs/current/conn.log}"
+HTTP_LOG="${HTTP_LOG:-/var/log/zeek/logs/current/http.log}"
+SSL_LOG="${SSL_LOG:-/var/log/zeek/logs/current/ssl.log}"
 
 [[ -x "$INSTALL_DIR/venv/bin/python" ]] || die "Detector Python missing: $INSTALL_DIR/venv/bin/python"
 [[ -f "$INSTALL_DIR/src/detector.py" ]] || die "Deployed detector.py missing"
 [[ -f "$INSTALL_DIR/src/behavior_detector.py" ]] || die "Deployed behavior_detector.py missing"
+[[ -f /etc/systemd/system/zeek-botnet-detector.service ]] || die "ML service unit missing after base install"
+[[ -f /etc/systemd/system/zeek-behavior-detector.service ]] || die "Behavior service unit missing after base install"
 
 proxy_args=()
 for proxy in "${TRUSTED_PROXIES[@]}"; do
@@ -1688,7 +1785,7 @@ BEHAVIOR_CMD=(
   "${ignore_args[@]}"
 )
 
-log "[2/3] Applying unified runtime service overrides"
+log "[2/4] Applying protected-IP/domain runtime services"
 mkdir -p \
   /etc/systemd/system/zeek-botnet-detector.service.d \
   /etc/systemd/system/zeek-behavior-detector.service.d
@@ -1725,6 +1822,7 @@ set_runtime_value SSL_LOG "$SSL_LOG"
 set_runtime_value DOMAIN_CORRELATION_MODE "zeek_http_host_then_tls_sni"
 
 systemctl daemon-reload
+systemctl enable zeek-botnet-detector.service zeek-behavior-detector.service >/dev/null
 systemctl restart zeek-botnet-detector.service zeek-behavior-detector.service
 sleep 2
 
@@ -1733,31 +1831,164 @@ systemctl is-active --quiet zeek-botnet-detector.service \
 systemctl is-active --quiet zeek-behavior-detector.service \
   || { journalctl -u zeek-behavior-detector.service -n 80 --no-pager; die "Behavior detector failed"; }
 
-log "[3/3] Verifying final-session-only storage"
+log "[3/4] Configuring dedicated Filebeat"
+if [[ "$SKIP_FILEBEAT" -eq 0 ]]; then
+  FILEBEAT_BIN="$(command -v filebeat || true)"
+  [[ -n "$FILEBEAT_BIN" ]] || die "filebeat command not found after base installation"
+
+  # Stop only the dedicated instance before refreshing its isolated config/keystore.
+  # The system-wide filebeat.service is intentionally left untouched.
+  systemctl stop filebeat-botnet.service 2>/dev/null || true
+  mkdir -p /etc/filebeat-botnet /var/lib/filebeat-botnet /var/log/filebeat-botnet
+
+  cat > /etc/filebeat-botnet/filebeat.yml <<EOF_FILEBEAT
+filebeat.inputs:
+  - type: filestream
+    id: zeek-botnet-alerts
+    enabled: true
+    paths:
+      - $INSTALL_DIR/logs/botnet_alerts.jsonl
+    parsers:
+      - ndjson:
+          target: ""
+          add_error_key: true
+    fields:
+      soc_stream: botnet_alert
+    fields_under_root: true
+
+  - type: filestream
+    id: zeek-behavior-alerts
+    enabled: true
+    paths:
+      - $INSTALL_DIR/logs/behavior_alerts.jsonl
+    parsers:
+      - ndjson:
+          target: ""
+          add_error_key: true
+    fields:
+      soc_stream: behavior_alert
+    fields_under_root: true
+
+processors:
+  - add_host_metadata: ~
+
+setup.ilm.enabled: false
+setup.template.enabled: false
+
+output.elasticsearch:
+  hosts:
+    - "$ES_HOST"
+  username: "$ES_USER"
+  password: "\${ES_PASSWORD}"
+  ssl.verification_mode: none
+  indices:
+    - index: "capstone-zeek-botnet-alerts-%{+yyyy.MM.dd}"
+      when.equals:
+        soc_stream: "botnet_alert"
+    - index: "capstone-zeek-behavior-alerts-%{+yyyy.MM.dd}"
+      when.equals:
+        soc_stream: "behavior_alert"
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat-botnet
+  name: filebeat
+  keepfiles: 7
+  permissions: 0640
+EOF_FILEBEAT
+  chmod 600 /etc/filebeat-botnet/filebeat.yml
+
+  "$FILEBEAT_BIN" keystore create --force \
+    --path.home /usr/share/filebeat \
+    --path.config /etc/filebeat-botnet \
+    --path.data /var/lib/filebeat-botnet >/dev/null
+
+  "$FILEBEAT_BIN" keystore add ES_PASSWORD --stdin --force \
+    --path.home /usr/share/filebeat \
+    --path.config /etc/filebeat-botnet \
+    --path.data /var/lib/filebeat-botnet \
+    < "$ES_PASSWORD_FILE" >/dev/null
+
+  "$FILEBEAT_BIN" test config \
+    -c /etc/filebeat-botnet/filebeat.yml \
+    --path.home /usr/share/filebeat \
+    --path.config /etc/filebeat-botnet \
+    --path.data /var/lib/filebeat-botnet >/dev/null \
+    || die "Dedicated Filebeat configuration test failed"
+
+  "$FILEBEAT_BIN" test output \
+    -c /etc/filebeat-botnet/filebeat.yml \
+    --path.home /usr/share/filebeat \
+    --path.config /etc/filebeat-botnet \
+    --path.data /var/lib/filebeat-botnet \
+    || die "Cannot connect dedicated Filebeat to Elasticsearch"
+
+  cat > /etc/systemd/system/filebeat-botnet.service <<EOF_SERVICE
+[Unit]
+Description=Dedicated Filebeat for Zeek Botnet and Behavior Alerts
+Wants=network-online.target
+After=network-online.target zeek-botnet-detector.service zeek-behavior-detector.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=$FILEBEAT_BIN -e -c /etc/filebeat-botnet/filebeat.yml --path.home /usr/share/filebeat --path.config /etc/filebeat-botnet --path.data /var/lib/filebeat-botnet --path.logs /var/log/filebeat-botnet
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+  systemctl daemon-reload
+  systemctl enable --now filebeat-botnet.service >/dev/null
+  sleep 1
+  systemctl is-active --quiet filebeat-botnet.service \
+    || { journalctl -u filebeat-botnet.service -n 80 --no-pager; die "Dedicated Filebeat failed"; }
+else
+  log "Dedicated Filebeat skipped by request"
+fi
+
+log "[4/4] Final verification"
 if grep -q 'write_json_line(DETECTION_LOG' "$INSTALL_DIR/src/detector.py"; then
   die "Deployed detector still writes detections.jsonl"
 fi
 
 if [[ "$PURGE_PREDICTIONS" -eq 1 ]]; then
+  mkdir -p "$INSTALL_DIR/logs"
   touch "$INSTALL_DIR/logs/detections.jsonl"
   truncate -s 0 "$INSTALL_DIR/logs/detections.jsonl"
   log "Old detections.jsonl truncated by request"
 else
-  log "Old detections.jsonl preserved. It will no longer grow in unified mode."
+  log "Old detections.jsonl preserved; it will no longer grow in unified mode"
 fi
 
-log "Unified installation complete"
-log "Capture interface: $SELECTED_INTERFACE (source=$INTERFACE_SOURCE)"
-log "Protected destination(s): ${PROTECTED_IPS[*]}"
-log "Proxy mode: $PROXY_MODE"
-log "Proxy header: ${PROXY_HEADER:-none}"
-log "Trusted proxies passed to Zeek resolver: ${TRUSTED_PROXIES[*]:-none}"
-log "ML rule: RF probability >=0.50 + >=50 RF-positive packets in rolling 1 second"
-log "Session close: idle 3s or maximum 60s"
-log "Persistent ML alerts: $INSTALL_DIR/logs/botnet_alerts.jsonl (final CONFIRMED sessions only)"
-log "Intermediate NORMAL/PENDING/ACTIVE ML events: not persisted to detections.jsonl"
-log "Behavior alerts: $INSTALL_DIR/logs/behavior_alerts.jsonl"
-log "Run: sudo ./verify.sh"
+if [[ "$BASE_RC" -ne 0 ]]; then
+  log "Base-installer status $BASE_RC was recovered successfully by unified finalization"
+fi
+
+log "============================================================"
+log "SOC-BOTNET Unified installation COMPLETE"
+log "Capture interface     : $SELECTED_INTERFACE ($INTERFACE_SOURCE)"
+log "Protected destination : ${PROTECTED_IPS[*]}"
+log "Proxy mode            : $PROXY_MODE"
+log "Trusted proxy         : ${TRUSTED_PROXIES[*]:-none}"
+log "Domain correlation    : Zeek HTTP Host -> TLS SNI -> unresolved"
+log "ML confirmation       : >=50 RF-positive packets / rolling 1s"
+log "Session close         : idle 3s or maximum 60s"
+log "ML service            : active"
+log "Behavior service      : active"
+if [[ "$SKIP_FILEBEAT" -eq 0 ]]; then
+  log "Dedicated Filebeat    : active -> $ES_HOST"
+  log "Elasticsearch secret  : stored in Filebeat keystore"
+fi
+log "Main filebeat.service : left untouched"
+log "Run verification      : sudo ./verify.sh"
+log "============================================================"
+
 INSTALLER
 chmod +x "$OUTPUT_REPO/install.sh"
 
@@ -1777,7 +2008,7 @@ if [[ -x "$SCRIPT_DIR/verify-base.sh" ]]; then
 fi
 
 echo "============================================================"
-echo " SOC-BOTNET unified v1.7.1 checks"
+echo " SOC-BOTNET unified v1.7.2 checks"
 echo "============================================================"
 
 D="$INSTALL_DIR/src/detector.py"
@@ -1828,16 +2059,28 @@ else
   fail "ML service has no --ssl-log argument"
 fi
 
-if grep -q -- '--trusted-proxy' <<< "$ML_UNIT"; then
-  ok "ML service receives trusted proxy configuration"
-else
-  fail "ML service has no --trusted-proxy argument"
+RUNTIME_PROXY_MODE=""
+RUNTIME_TRUSTED_PROXIES=""
+if [[ -r "$RUNTIME_CONF" ]]; then
+  # shellcheck disable=SC1090
+  source "$RUNTIME_CONF"
+  RUNTIME_PROXY_MODE="${PROXY_MODE:-direct}"
+  RUNTIME_TRUSTED_PROXIES="${TRUSTED_PROXIES:-}"
 fi
 
-if grep -q -- '--trusted-proxy' <<< "$BEHAVIOR_UNIT"; then
-  ok "Behavior service receives trusted proxy configuration"
+if [[ -n "$RUNTIME_TRUSTED_PROXIES" ]]; then
+  if grep -q -- '--trusted-proxy' <<< "$ML_UNIT"; then
+    ok "ML service receives trusted proxy configuration"
+  else
+    fail "Runtime has trusted proxies but ML service has no --trusted-proxy argument"
+  fi
+  if grep -q -- '--trusted-proxy' <<< "$BEHAVIOR_UNIT"; then
+    ok "Behavior service receives trusted proxy configuration"
+  else
+    fail "Runtime has trusted proxies but Behavior service has no --trusted-proxy argument"
+  fi
 else
-  fail "Behavior service has no --trusted-proxy argument"
+  ok "No trusted proxy argument required (proxy mode: ${RUNTIME_PROXY_MODE:-direct})"
 fi
 
 if [[ -r "$RUNTIME_CONF" ]]; then
@@ -1857,6 +2100,8 @@ if [[ -f /etc/filebeat-botnet/filebeat.yml ]]; then
   else
     ok "Dedicated Filebeat does not ship intermediate predictions"
   fi
+  if grep -q '\${ES_PASSWORD}' /etc/filebeat-botnet/filebeat.yml; then ok "Filebeat YAML references keystore secret"; else fail "Filebeat YAML does not reference ES_PASSWORD keystore key"; fi
+  if systemctl is-active --quiet filebeat-botnet.service; then ok "filebeat-botnet.service active"; else fail "Dedicated Filebeat service inactive"; fi
 else
   warn "Dedicated Filebeat config absent (possibly installed with --skip-filebeat)"
 fi
@@ -1872,11 +2117,11 @@ VERIFY
 chmod +x "$OUTPUT_REPO/verify.sh"
 
 cat > "$OUTPUT_REPO/VERSION" <<'EOF_VERSION'
-1.7.1-unified
+1.7.2-unified
 EOF_VERSION
 
 cat > "$OUTPUT_REPO/UNIFIED.md" <<'DOC'
-# SOC-BOTNET Unified v1.7.1
+# SOC-BOTNET Unified v1.7.2
 
 This repository combines the base SOC-BOTNET installer, the XFF update, and the
 latest Random Forest attack-session detector.
@@ -1902,6 +2147,8 @@ Final BOTNET alerts add only `domain` as new target metadata. Existing Filebeat/
 
 ## Automatic protected destination
 
+The installer now prompts for the Elasticsearch password interactively by default. The password is hidden while typed and is stored in the dedicated Filebeat keystore, not in `filebeat.yml`. `--es-password-file FILE` remains available for non-interactive deployment.
+
 Normal installation requires no manual destination-IP edit:
 
 ```bash
@@ -1909,7 +2156,8 @@ sudo ./install.sh \
   --interface ens160 \
   --skip-zeek-install \
   --trusted-proxy 10.70.184.2 \
-  --es-password-file /root/es.pass
+  --es-host https://10.70.128.26:9200 \
+  --es-user elastic
 ```
 
 If `ens160` owns `10.70.184.24`, the installer automatically starts the ML service with `--protected-ip 10.70.184.24`.
@@ -1922,7 +2170,8 @@ sudo ./install.sh \
   --interface ens160 \
   --protected-ip 10.70.184.24 \
   --skip-zeek-install \
-  --es-password-file /root/es.pass
+  --es-host https://10.70.128.26:9200 \
+  --es-user elastic
 ```
 
 ## Final alert fields
@@ -1941,14 +2190,14 @@ sudo journalctl -u zeek-botnet-detector.service -n 30 --no-pager
 
 ## Push branch
 
-The builder keeps the `.git` history from SOC-BOTNET and creates `unified-v1.7.1` by default:
+The builder keeps the `.git` history from SOC-BOTNET and creates `unified-v1.7.2` by default:
 
 ```bash
 cd ~/SOC-BOTNET-UNIFIED
 git status
 git add .
 git commit -m "feat: update SOC-BOTNET session tracking and Zeek domain correlation"
-git push -u origin unified-v1.7.1
+git push -u origin unified-v1.7.2
 ```
 DOC
 
